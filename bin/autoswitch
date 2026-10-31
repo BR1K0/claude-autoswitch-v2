@@ -9,9 +9,12 @@
   autoswitch report          summarise the shadow log: what would have been switched
   autoswitch watcher         print the prompt to paste into a Haiku chat (the Watcher)
   autoswitch unpin [app id]  clear the manual pin of one chat, or of all chats: a pinned chat is never switched
-  autoswitch speed [instant|seamless]
-                             how `on` switches: instant (never hold the prompt, the switch applies from the next
-                             message) or seamless (hold, switch, re-send). No argument: print the current value
+  autoswitch speed [instant|seamless|predictive|inline]
+                             how `on` switches. inline (recommended): the autoswitch-inline plugin picks each
+                             turn's model, so the first message is answered by the right model with no stop and no
+                             wait (installs the plugin). predictive: switch while you type (macOS). instant: never
+                             hold, the switch applies from the next message. seamless: hold, switch, re-send.
+                             No argument: print the current value
 """
 import json
 import os
@@ -24,7 +27,10 @@ HOME = os.path.expanduser("~")
 BASE = os.path.expanduser(os.environ.get("AUTOSWITCH_DIR", "~/.autoswitch"))
 APP = os.path.join(BASE, "app")
 SETTINGS = os.path.join(HOME, ".claude", "settings.json")
-SPEEDS = ("instant", "seamless")
+SPEEDS = ("instant", "seamless", "predictive", "inline")
+MARKETPLACE = "claude-autoswitch"  # .claude-plugin/marketplace.json
+PLUGIN = "autoswitch-inline@" + MARKETPLACE
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # ~/.autoswitch/app, or the repo checkout
 MODES = {"on": "enforce", "shadow": "shadow", "hint": "hint", "off": "off"}
 MARK = os.path.join(APP, "hook") + os.sep  # our hook commands all point into this folder
 TASK = os.environ.get("AUTOSWITCH_TASK", "AutoswitchScorer")  # Windows scheduled task (install.ps1)
@@ -62,7 +68,75 @@ def set_mode(word):
 def get_speed():
     """Same rule as the hook (sbqueue.speed): $AUTOSWITCH_SPEED, then the `speed` file; anything else is seamless."""
     v = (os.environ.get("AUTOSWITCH_SPEED") or "").strip() or read("speed")
-    return "instant" if v.strip().lower() == "instant" else "seamless"
+    v = v.strip().lower()
+    return v if v in SPEEDS else "seamless"
+
+
+def claude_bin():
+    """The `claude` command: $AUTOSWITCH_CLAUDE, then PATH, then (macOS) the newest one bundled with the desktop app."""
+    import glob
+    import shutil
+    if os.environ.get("AUTOSWITCH_CLAUDE"):
+        return os.environ["AUTOSWITCH_CLAUDE"]
+    found = shutil.which("claude")
+    if found:
+        return found
+    if sys.platform == "darwin":
+        app = glob.glob(os.path.join(HOME, "Library", "Application Support", "Claude", "claude-code", "*", "*",
+                                     "claude.app", "Contents", "MacOS", "claude"))
+        if app:
+            return max(app, key=os.path.getmtime)
+    return None
+
+
+def plugin_commands(claude="claude"):
+    return [[claude, "plugin", "marketplace", "add", ROOT],
+            [claude, "plugin", "install", PLUGIN, "--scope", "user"]]
+
+
+def install_plugin():
+    """Add this folder as a plugin marketplace and install (or re-enable) autoswitch-inline for the user.
+    Both commands are safe to run again. Returns True when the plugin is installed."""
+    import subprocess
+    os.makedirs(p("inline"), exist_ok=True)  # the plugin's per-chat markers
+    if not os.path.isfile(os.path.join(ROOT, ".claude-plugin", "marketplace.json")):
+        print(f"note: no plugin marketplace in {ROOT}; run ./install.sh again from the repo, then this command")
+        return False
+    claude = claude_bin()
+    manual = "\n".join("  " + " ".join(f'"{a}"' if " " in a else a for a in c) for c in plugin_commands())
+    if not claude or os.environ.get("AUTOSWITCH_NO_PLUGIN_INSTALL"):
+        print("Install the plugin with:\n" + manual)
+        return False
+    for cmd in plugin_commands(claude):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as e:
+            r = None
+            err = str(e)
+        if r is None or r.returncode != 0:
+            print(f"could not run `{' '.join(cmd[1:])}`: {(r.stderr or r.stdout).strip()[-300:] if r else err}")
+            print("Install the plugin by hand with:\n" + manual)
+            return False
+    print(f"plugin {PLUGIN} installed (user scope). Open a new chat, or run /reload-plugins, to load it.")
+    return True
+
+
+def uninstall_plugin():
+    """uninstall.sh: remove the plugin and its marketplace if `autoswitch speed inline` added them."""
+    import subprocess
+    if not os.path.isdir(p("inline")):
+        return  # `autoswitch speed inline` never ran: nothing of ours to remove
+    claude = claude_bin()
+    if not claude:
+        print(f"note: remove the plugin with `claude plugin uninstall {PLUGIN}` and `claude plugin marketplace remove {MARKETPLACE}`")
+        return
+    for cmd in ([claude, "plugin", "uninstall", PLUGIN, "--scope", "user"],
+                [claude, "plugin", "marketplace", "remove", MARKETPLACE]):
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    print(f"plugin {PLUGIN} and its marketplace removed")
 
 
 def speed(word=None):
@@ -71,7 +145,7 @@ def speed(word=None):
         return
     word = word.strip().lower()
     if word not in SPEEDS:
-        print("usage: autoswitch speed [instant|seamless]", file=sys.stderr)
+        print("usage: autoswitch speed [instant|seamless|predictive|inline]", file=sys.stderr)
         sys.exit(2)
     os.makedirs(BASE, exist_ok=True)
     with open(p("speed"), "w", encoding="utf-8") as f:
@@ -79,8 +153,16 @@ def speed(word=None):
     notes = {
         "instant": "INSTANT: prompts are never held. This message answers on the current model; the switch applies from the next one.",
         "seamless": "SEAMLESS: a prompt that needs another model is held, the chat is switched, and the prompt is re-sent on the new model.",
+        "predictive": "PREDICTIVE: the chat is switched while you type, so the message usually goes out on the right model with no stop.\n"
+                      "  If the switch has not landed by Enter, an up-switch or a message of 400+ characters is held like seamless; anything else goes through.",
+        "inline": "INLINE: the autoswitch-inline plugin picks each turn's model inside Claude Code: the right model on the first message, no stop, no wait.\n"
+                  "  Chats opened before the plugin was installed fall back to predictive until you open a new one.",
     }
     print(notes[word])
+    if word in ("predictive", "inline") and WIN:
+        print("note: the typing reader is macOS-only; on Windows predictive behaves like instant (plus the holds), and the inline plugin is untested")
+    if word == "inline":
+        install_plugin()
     if os.environ.get("AUTOSWITCH_SPEED") and os.environ["AUTOSWITCH_SPEED"].strip().lower() != word:
         print(f"note: AUTOSWITCH_SPEED={os.environ['AUTOSWITCH_SPEED']} is set and wins over the file")
 
@@ -663,6 +745,8 @@ def main():
         unpin(sys.argv[2] if len(sys.argv) > 2 else None)
     elif cmd == "_settings-install":
         settings_install(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+    elif cmd == "_plugin-uninstall":
+        uninstall_plugin()
     elif cmd == "_settings-uninstall":
         settings_uninstall()
     elif cmd == "_settings-snapshot":

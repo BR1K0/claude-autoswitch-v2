@@ -162,6 +162,21 @@ def handle(path):
         fail(path)
 
 
+def spawn_typeahead():
+    """Speed predictive (or inline): start the typeahead reader (macOS) if it is not running. It runs detached and
+    exits by itself once no Watcher heartbeat is fresh, so it lives as long as a Watcher does."""
+    if sys.platform != "darwin":
+        return
+    try:
+        import sbqueue
+        if sbqueue.speed() not in ("predictive", "inline"):
+            return
+        subprocess.Popen([sys.executable, os.path.join(HERE, "typeahead.py"), "spawn"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception as e:  # never let the reader stop the Watcher
+        log("typeahead reader not started: %s" % e)
+
+
 def pending():
     try:
         return sorted(f for f in os.listdir(p("pending")) if f.endswith(".json"))
@@ -230,12 +245,14 @@ def sweep():
         except OSError:
             pass
     heartbeat()
+    spawn_typeahead()  # the speed changed to predictive, or the reader died
 
 
 def main():
     for d in ("pending", "working", "done"):
         os.makedirs(p(d), exist_ok=True)
     heartbeat()
+    spawn_typeahead()
     n = 0
     while True:
         for f in pending():

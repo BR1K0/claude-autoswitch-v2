@@ -1,0 +1,16 @@
+{
+  "name": "claude-autoswitch",
+  "owner": {
+    "name": "claude-autoswitch"
+  },
+  "metadata": {
+    "description": "claude-autoswitch: picks the cheapest Claude model that can handle each prompt. The autoswitch-inline plugin switches each turn's model inline."
+  },
+  "plugins": [
+    {
+      "name": "autoswitch-inline",
+      "source": "./plugin/autoswitch-inline",
+      "description": "Picks each turn's model inside Claude Code (no stop, no wait) and shows a budget-mode band above the prompt. Needs claude-autoswitch installed (./install.sh) and `autoswitch speed inline`."
+    }
+  ]
+}

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.0
+
+Two new speeds that answer the first message on the right model, with no stop notice and no wait.
+
+- **`inline` (recommended, macOS):** the bundled Claude Code plugin `autoswitch-inline` (`plugin/`, marketplace in
+  `.claude-plugin/`) picks each main-loop turn's model itself, from the installed hook's decision (`hint.py` with
+  `AUTOSWITCH_DRY=1`). The hook stops, queues and shows nothing in those chats, and they need no Watcher. The
+  plugin marks each chat it runs in (`~/.autoswitch/inline/<chat id>`); chats opened before it was installed fall
+  back to `predictive`. Fails open: a router error or a decision slower than 1.5 s leaves the turn's model alone.
+- **Budget bar:** with `inline`, a band above the prompt box shows the last turn's model ("↪ Opus 5.5 (kept)",
+  "↪ Haiku 5.5 answered") and Save / Balanced / Quality buttons that write `~/.autoswitch/budget`.
+- **`predictive` (macOS):** a read-only reader of the prompt box (`hook/typeahead.swift`, started by the Watcher)
+  switches the chat while you type. At Enter, a message whose switch has not landed is held like `seamless` only for
+  an up-switch or a message of 400+ characters (`AUTOSWITCH_HOLD_CHARS`); otherwise it goes through at once.
+- **Same tier, newer model:** a chat on an older version of its tier (Opus 4.7, Sonnet 5, ...) moves to the tier's
+  current model, except in long chats (`AUTOSWITCH_UPGRADE_MAX_TOKENS`, 100k), pinned chats and handoffs. New chats
+  get the request's model from the plugin (`AUTOSWITCH_CURRENT_MODEL`).
+- **`stoptext`:** `echo hide > ~/.autoswitch/stoptext` hides the "↪ Switched to X" text on a held message.
+- `autoswitch speed [inline|predictive|instant|seamless]`; `inline` also runs `claude plugin marketplace add` and
+  `claude plugin install autoswitch-inline@claude-autoswitch --scope user` (or prints them). `install.sh` copies the
+  plugin and builds the typeahead reader; `uninstall.sh` removes both.
+- The dry-run decision never writes state: no pin observation, no shadow log, no lasting-switch record, and the
+  clipboard check no longer records what it saw.
+- Docs: README "Speed" section for all four speeds, the band, the newer-model upgrade; new demo image of the band.
+
 ## 0.2.0
 
 v2, everything off by default (`~/.autoswitch/handoff`, `~/.autoswitch/rollover`); with both off, decisions are

@@ -158,23 +158,25 @@ def _state(new=None):
         return {}
 
 
-def fresh_image(now=None):
+def fresh_image(now=None, remember=True):
     """The clipboard image if it looks pasted into this prompt, else None.
 
     Fresh = the pasteboard changed since the last prompt we looked at, or the same image was first seen less
     than IMAGE_WINDOW seconds ago (the user may paste the same screenshot into a second prompt).
     Returns {"text": OCR text (capped), "image": True} or None.
+    remember=False (a dry run: a typed draft or the inline plugin) looks without recording what it saw.
     """
     now = now or time.time()
     clip = read_clipboard()
     prev = _state()
+    save = _state if remember else (lambda new: None)
     if not clip or not clip.get("image"):
-        _state({"count": clip and clip.get("count"), "image": False, "first_seen": None})
+        save({"count": clip and clip.get("count"), "image": False, "first_seen": None})
         return None
     count = clip.get("count")
     same = count is not None and prev.get("count") == count and prev.get("image")
     first_seen = prev.get("first_seen") if same else now
-    _state({"count": count, "image": True, "first_seen": first_seen})
+    save({"count": count, "image": True, "first_seen": first_seen})
     if same and now - (first_seen or now) > IMAGE_WINDOW:
         return None  # an old screenshot still sitting on the clipboard
     return {"image": True, "text": (clip.get("text") or "").strip()[:OCR_CHARS]}

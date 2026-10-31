@@ -7,6 +7,8 @@ Modes (AUTOSWITCH_MODE, or file $AUTOSWITCH_DIR/mode; legacy file `enabled` = en
            Never blocks, queues or switches. Prompt text is NOT logged (length only).
   enforce  block the prompt and queue a request; the Watcher switches this chat's model and re-sends it.
 Policy (gate, dwell guard, pins, Sonnet default) lives in policy.py. Any failure lets the prompt through.
+Speeds (sbqueue.speed): seamless, instant, predictive (typeahead.py), inline (the autoswitch-inline plugin).
+AUTOSWITCH_DRY=1: print the decision as one JSON line and change nothing (used by typeahead.py and the plugin).
 """
 import json
 import os
@@ -147,6 +149,39 @@ def lost_note(lost):
     return f" | Autoswitch could not re-send your earlier prompt, please send it again: {lost!r}" if lost else ""
 
 
+DRY = os.environ.get("AUTOSWITCH_DRY") == "1"  # typeahead.py and the inline plugin ask for the decision: print it, change nothing
+HOLD_CHARS = env_num("AUTOSWITCH_HOLD_CHARS", "400", int)
+UPGRADE_MAX_TOKENS = env_num("AUTOSWITCH_UPGRADE_MAX_TOKENS", "100000")
+TIERS = ("haiku", "sonnet", "opus")
+
+
+def predictive_hold(prompt, cur, target):
+    """Predictive speed, at Enter, when the switch it wanted has not landed (a new chat's first message, or a send
+    within ~3 s of the draft settling): hold this one message like seamless only when it is worth the wait.
+    - an up-switch: otherwise the message is answered by a weaker model than it needs;
+    - a big message (AUTOSWITCH_HOLD_CHARS, 400+): a long task would run all its turns on the wrong model.
+    A short message that only wanted a cheaper model goes through at once; the switch applies from the next one."""
+    import policy
+    import sbqueue
+    if sbqueue.speed() != "predictive":
+        return False
+    a, b = policy.tier_of(cur), policy.tier_of(target)
+    up = a in TIERS and b in TIERS and TIERS.index(b) > TIERS.index(a)
+    return up or len(prompt) >= HOLD_CHARS
+
+
+def stop_text(tier):
+    """The text after the app's own "Operation stopped by hook:" prefix. The `stoptext` file set to `hide` leaves
+    only the prefix: a single space, because without a stopReason the app does not stop the message at all."""
+    try:
+        with open(sb_path("stoptext"), encoding="utf-8") as f:
+            if f.read().strip().lower() == "hide":
+                return " "
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return f"↪ Switched to {tier.capitalize()}"
+
+
 def shadow_log(rec):
     try:
         import sbqueue as sb
@@ -170,18 +205,21 @@ def main():
     hook = json.load(sys.stdin)
     if sb.silent():
         return
+    if sb.speed() == "inline" and not DRY and not sb.inline_marked(hook.get("session_id")):
+        os.environ["AUTOSWITCH_SPEED"] = "predictive"  # this chat has no plugin (opened before it was installed)
+    inline = sb.speed() == "inline"
     mode = sb.mode()
     ho = mode != "off" and _handoff_on()  # Autoswitch v2: every new path below is behind `ho`
-    ro = ho and _rollover_on()  # Step 4 rollover: every rollover path is behind `ro` as well
+    ro = ho and _rollover_on() and not DRY  # Step 4 rollover: every rollover path is behind `ro` as well
     paused = False
     no_watcher = False
     if mode == "enforce" and os.environ.get("CLAUDE_CODE_ENTRYPOINT") != "claude-desktop":
         mode = "shadow"  # only desktop-app chats can be switched; never block the CLI or headless runs
-    if mode == "enforce" and not sb.watcher_alive():
+    if mode == "enforce" and not DRY and not sb.watcher_alive():
         mode, no_watcher = "shadow", True  # nobody would re-send a blocked prompt: only log, never block
-        paused = True
+        paused = not inline  # inline needs no Watcher in a chat with the plugin: no "paused" note there
     raw = hook.get("prompt", "")
-    if ho:
+    if ho and not DRY:
         import handoff
         got = handoff.deliver(raw, host_session_id(), hook.get("session_id"))
         if got is not None:  # part 2's first message: delivered exactly once, never routed
@@ -203,7 +241,7 @@ def main():
             rollover.recover()  # unfinished rollovers: resumed or undone
         except Exception:
             pass
-    rid = sb.consume_pass(raw) if mode == "enforce" else None
+    rid = sb.consume_pass(raw) if mode == "enforce" and not DRY else None
     if rid:
         sb.take_lost(hook.get("session_id"), rid)  # it did arrive (maybe after settle timed out): drop "please resend"
         return  # re-sent by the Watcher: loop guard, route nothing
@@ -219,6 +257,8 @@ def main():
         return  # only app-injected text: nothing to route, never block
     if not clean(prompt) or prompt.lstrip().startswith("/"):
         return
+    if ho:
+        import handoff
     ctx_on = ho and handoff.context_enabled()
     asked_followup = is_followup(prompt)
     followup = asked_followup
@@ -228,7 +268,7 @@ def main():
     img = None
     if mode != "off":
         import images
-        img = images.fresh_image()  # a pasted screenshot: never block (the re-send would drop it), score its text too
+        img = images.fresh_image(remember=not DRY)  # a pasted screenshot: never block (the re-send would drop it), score its text too
         if img and img["text"]:
             scored = f"{scored}\n\n[Text in the attached screenshot]\n{img['text']}"
     result = _score(scored, model_input)
@@ -265,7 +305,7 @@ def main():
             info = resolve(hook.get("session_id"), wait=0)  # fallback source, mainly for the current model
         cur = info and info["model"]
         tokens = history_tokens(hook.get("transcript_path"))
-        if app_id and info:
+        if app_id and info and not DRY:
             pins.observe(app_id, cur)  # remembers the model seen; a change nobody here made pins the chat
         new_chat = not info and first_prompt(hook.get("transcript_path"))
         pinned = bool(app_id) and pins.is_pinned(hook.get("session_id"), app_id, cur, hook.get("transcript_path"))
@@ -306,6 +346,22 @@ def main():
                                        ext)
         if info and d["target"] == cur:
             d = {"target": None, "reason": "already on target model"}  # never block a chat that needs no switch
+        if (not d["target"] and not pinned and not handoff_to and app_id and carryable(prompt)
+                and not (info and info["sessionId"] != app_id)):
+            # staying in this tier: move an older version (Opus 4.7, Sonnet 5...) to the tier's current model,
+            # which is newer and cheaper. Not in a long chat: the first message on a new model re-reads it all.
+            have = cur or os.environ.get("AUTOSWITCH_CURRENT_MODEL")  # the plugin passes the model a new chat runs on
+            newer = policy.latest_in_tier(have)
+            length = size["tokens"] if ho else tokens
+            if newer and (length is None or length < UPGRADE_MAX_TOKENS):
+                d = {"target": newer, "reason": f"same tier, newer model ({have} -> {newer})"}
+        if DRY:  # typeahead.py / the inline plugin: the decision only, no side effects, nothing queued or shown
+            if sb.mode() != "enforce":
+                d = {"target": None, "reason": f"mode is {sb.raw_mode()}: nothing is switched"}
+            print(json.dumps({"target": d["target"], "reason": d["reason"], "handoff_to": handoff_to,
+                              "current": cur, "app_id": app_id, "label": label, "confidence": round(confidence, 3),
+                              "screenshot": bool(img), "new_chat": bool(new_chat)}))
+            return
         log = {"ts": time.time(), "mode": mode, "session": app_id, "new_chat": new_chat, "current": cur,
                "label": label, "confidence": round(confidence, 3), "would_target": d["target"],
                "reason": d["reason"], "prompt_chars": len(prompt), "history_tokens_est": None if tokens is None else int(tokens),
@@ -348,23 +404,38 @@ def main():
                                                          "additionalContext": handoff.instruction(req)}}))
                 return
             msg += notes
+        if sb.mode() == "enforce" and inline:
+            # inline: the autoswitch-inline plugin sends this turn's requests to the target itself, so nothing is
+            # stopped, queued or shown here. Only notes the user must see (lost prompts, handoff timeouts).
+            extra = (notes if ho else "") + lost_note(sb.take_lost(hook.get("session_id")))
+            if extra.strip(" |"):
+                print(json.dumps({"systemMessage": extra.strip(" |")}))
+            return
         if mode == "enforce" and d["target"] and app_id and (info or new_chat) and img:
             # screenshot: let this turn through untouched and switch the chat for the NEXT one (no re-send)
             sb.enqueue(app_id, d["target"], prompt, label, confidence,
                        cli_session_id=hook.get("session_id"), resend=False)
             msg += f" | screenshot attached: this answer stays on the current model, switching the chat to {policy.tier_of(d['target']).capitalize()} for your next message"
-        elif mode == "enforce" and d["target"] and app_id and (info or new_chat) and sb.speed() == "instant":
-            # instant: never hold the prompt. This answer runs on the current model, the switch applies from the next message.
-            sb.enqueue(app_id, d["target"], prompt, label, confidence,
-                       cli_session_id=hook.get("session_id"), resend=False)
+        elif mode == "enforce" and d["target"] and app_id and (info or new_chat) and sb.never_holds() \
+                and not predictive_hold(prompt, cur or os.environ.get("AUTOSWITCH_CURRENT_MODEL"), d["target"]):
+            # instant / predictive: never hold the prompt. This answer runs on the current model, the switch applies
+            # from the next message. In predictive mode the typed draft usually switched the chat already (then
+            # d["target"] is None here); a typeahead switch to this target still in flight is not queued twice.
+            if sb.open_switch(app_id) != d["target"]:
+                sb.enqueue(app_id, d["target"], prompt, label, confidence,
+                           cli_session_id=hook.get("session_id"), resend=False)
             msg = f"↪ Switching to {policy.tier_of(d['target']).capitalize()}"
         elif mode == "enforce" and d["target"] and app_id and (info or new_chat):
+            if sb.speed() == "predictive":
+                sb.drop_typeahead(app_id)  # this held prompt's request sets the model itself
             sb.enqueue(app_id, d["target"], prompt, label, confidence,
                        cli_session_id=hook.get("session_id"))
             # continue:false stops the turn with no "blocked" wording (the app shows "Operation stopped by hook:").
             # The text is what the user sees; the prompt is kept in the transcript, which is why the re-send is a second turn.
-            print(json.dumps({"continue": False, "stopReason": f"↪ Switched to {policy.tier_of(d['target']).capitalize()}"}))
+            print(json.dumps({"continue": False, "stopReason": stop_text(policy.tier_of(d['target']))}))
             return
+    if DRY:
+        return  # hint mode, or no decision to print: the caller leaves the model alone
     if no_watcher and not ho:  # v2 shows its own "paused" note once per chat instead
         msg += " | Autoswitch is on but no Watcher session is running, so nothing was switched (see `autoswitch watcher`)"
     print(json.dumps({"systemMessage": msg + lost_note(sb.take_lost(hook.get("session_id")))}))
@@ -418,7 +489,8 @@ def _decide_v2(label, confidence, cur, size, pinned, mode, info, hook, bmode, pt
         tokens = size["tokens"]
         ext.update(size_precise=_int(size["precise"]), size_method=size["method"])
     prev = handoff.last_want(app_id)
-    handoff.record_want(app_id, tgt_tier)
+    if not DRY:  # a typed draft or a plugin query is not a request: only sent prompts count toward the lasting-switch rule
+        handoff.record_want(app_id, tgt_tier)
     pl = handoff.plan(tgt_tier, policy.tier_of(cur), size, prev, ext.get("new_task", False), bmode)
     ext.update(plan=pl["action"], zone=pl["zone"], prev_want=prev)
     if pl["action"] == "inplace":

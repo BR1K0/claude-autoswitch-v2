@@ -6,6 +6,7 @@ Layout under $AUTOSWITCH_DIR (default ~/.autoswitch):
   working/<id>.json  claimed by the Watcher (moved here by watch.py)
   done/<id>.json     finished or failed requests
   pass/<id>          loop guard: one-shot token the hook consumes
+  inline/<cli id>    written by the autoswitch-inline plugin: this chat picks its model inline (speed inline)
 """
 import json
 import os
@@ -44,9 +45,17 @@ def silent():
     return raw_mode() == "off"
 
 
+SPEEDS = ("instant", "predictive", "inline")  # anything else is seamless
+
+
 def speed():
     """seamless (default): hold the prompt, switch, re-send it, so it answers on the new model.
-    instant: never hold; the switch applies from the next message. $AUTOSWITCH_SPEED, then the `speed` file."""
+    instant: never hold; the switch applies from the next message.
+    predictive: switch while you type (typeahead.py), so the message usually goes out on the right model already;
+    at submit it behaves like instant, except that it holds an up-switch or a big message the switch missed.
+    inline: the autoswitch-inline plugin picks each turn's model inside Claude Code: no stop, no wait; the hook
+    stops, queues and shows nothing. Chats without the plugin fall back to predictive.
+    $AUTOSWITCH_SPEED, then the `speed` file."""
     v = (os.environ.get("AUTOSWITCH_SPEED") or "").strip()
     if not v:
         try:
@@ -54,7 +63,20 @@ def speed():
                 v = f.read().strip()
         except (OSError, UnicodeError, ValueError):
             v = ""  # unreadable or corrupt file: seamless
-    return "instant" if v.lower() == "instant" else "seamless"
+    v = v.strip().lower()
+    return v if v in SPEEDS else "seamless"
+
+
+def never_holds():
+    """instant, predictive and inline never stop a prompt (predictive may still hold one: hint.predictive_hold)."""
+    return speed() in SPEEDS
+
+
+def inline_marked(cli_session_id):
+    """True when the autoswitch-inline plugin runs in this chat: it writes inline/<cli session id> before the hook
+    runs. A chat opened before the plugin was installed has no marker and keeps the predictive behaviour."""
+    cli = str(cli_session_id or "")
+    return bool(cli) and cli.replace("-", "").isalnum() and os.path.exists(path("inline", cli))
 
 
 def enabled():
@@ -70,7 +92,8 @@ def watcher_alive():
         return False
 
 
-def enqueue(app_session_id, target_model, prompt, label, confidence, cli_session_id=None, resend=True):
+def enqueue(app_session_id, target_model, prompt, label, confidence, cli_session_id=None, resend=True,
+            typeahead=False):
     import uuid
     rid = uuid.uuid4().hex[:12]
     for d in ("pending", "working", "done", "pass"):
@@ -86,6 +109,8 @@ def enqueue(app_session_id, target_model, prompt, label, confidence, cli_session
         "ts": time.time(),
         "resend": resend,  # False: switch the model only (the prompt went through with its screenshot)
     }
+    if typeahead:
+        req["typeahead"] = True  # queued while the user was still typing (typeahead.py); a newer draft may replace it
     # the token lets exactly one re-sent prompt with this id pass the hook. It must exist before the request is
     # visible in pending/: settle reads "no token" as "the re-send arrived" and would close it ok at once
     tok = path("pass", rid)
@@ -103,6 +128,51 @@ def enqueue(app_session_id, target_model, prompt, label, confidence, cli_session
                 os.remove(f)
         raise
     return rid
+
+
+def open_switch(app_session_id):
+    """The model a not-yet-finished switch-only request will set on this chat (pending or working), or None."""
+    best = None
+    for d in ("pending", "working"):
+        try:
+            names = os.listdir(path(d))
+        except OSError:
+            continue
+        for n in names:
+            if not n.endswith(".json"):
+                continue
+            try:
+                with open(path(d, n), encoding="utf-8") as f:
+                    r = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(r, dict) and r.get("session_id") == app_session_id and not r.get("resend", True) and \
+                    (best is None or r.get("ts", 0) > best.get("ts", 0)):
+                best = r
+    return best and best.get("model")
+
+
+def drop_typeahead(app_session_id):
+    """Withdraw this chat's typeahead requests the Watcher has not claimed yet (the draft changed its mind).
+    Returns how many were removed. A claimed one (working/) runs; the next draft or the hook corrects it."""
+    n = 0
+    try:
+        names = os.listdir(path("pending"))
+    except OSError:
+        return 0
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        p = path("pending", name)
+        try:
+            with open(p, encoding="utf-8") as f:
+                r = json.load(f)
+            if isinstance(r, dict) and r.get("session_id") == app_session_id and r.get("typeahead"):
+                os.remove(p)
+                n += 1
+        except (OSError, ValueError):
+            continue
+    return n
 
 
 _WRAP = re.compile(r"<cross-session-message\b[^>]*>(.*?)</cross-session-message>", re.S)

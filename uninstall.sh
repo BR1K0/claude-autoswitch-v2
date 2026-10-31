@@ -16,6 +16,9 @@ if ! python3 "$CLI" _settings-uninstall; then
   exit 1
 fi
 
+python3 "$CLI" _plugin-uninstall || true  # the autoswitch-inline plugin, if `autoswitch speed inline` installed it
+pkill -f "$BASE/bin/typeahead" 2>/dev/null || true  # the typeahead reader (speed predictive)
+
 echo "==> Stopping the scorer"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
 rm -f "$PLIST"
