@@ -7,23 +7,51 @@ const SPEED = `${HOME}/.autoswitch/speed`
 const BUDGET = `${HOME}/.autoswitch/budget`
 const HINT = `${HOME}/.autoswitch/app/hook/hint.py`
 const MARKER = `${HOME}/.autoswitch/inline/cli-session`
+const LOG = `${HOME}/.autoswitch/inline.jsonl`
+
+// Windows: no HOME, USERPROFILE and OS=Windows_NT, backslash paths, `py -3` / `python` instead of python3.
+const WIN_HOME = 'C:\\Users\\test'
+const WIN_BASE = `${WIN_HOME}\\.autoswitch`
+const WIN_SPEED = `${WIN_BASE}\\speed`
+const WIN_HINT = `${WIN_BASE}\\app\\hook\\hint.py`
+const WIN_LOG = `${WIN_BASE}\\inline.jsonl`
+const WIN_MARKER = `${WIN_BASE}\\inline\\cli-session`
+const WIN_PYCMD = `${WIN_BASE}\\python-cmd`
+const WINDOWS = { USERPROFILE: WIN_HOME, OS: 'Windows_NT' }
 const HOST_ID = 'host-chat-id'
+
+// The engine resolves a path the host OS calls relative against the working directory before the hooks see it:
+// on macOS/Linux `C:\Users\...` is relative, on Windows `/home/test/...` gains the current drive. Undo both, so
+// every case reads the same files on every OS the suite runs on.
+const key = (path: string) => {
+  const drive = path.lastIndexOf('C:\\Users\\')
+  if (drive >= 0) return path.slice(drive)
+  return path.includes(HOME.replaceAll('/', '\\')) ? path.replace(/^[A-Za-z]:/, '').replaceAll('\\', '/') : path
+}
 
 type Router = (stdin: string) => { stdout: string; exitCode?: number } | 'fail' | 'slow'
 
 // Everything beneath the plugin: files, env, clock, the router process, the model.
-const world = (on: On, files: Record<string, string>, router: Router) => {
+// `env` replaces HOME (Windows cases); `missing` are commands that cannot start (not installed); `exits` start
+// but exit with that code (the Windows Store `python` stub).
+const world = (
+  on: On,
+  files: Record<string, string>,
+  router: Router,
+  { env = { HOME } as Record<string, string>, missing = [] as string[], exits = {} as Record<string, number>, log = LOG } = {},
+) => {
   const sent: { turnId: string; index: number; model: string; agentId?: string }[] = []
   const asked: { argv: readonly string[]; stdin: string; env: Record<string, string>; timeoutMs?: number }[] = []
-  const logged: string[] = []
+  const tried: string[][] = []
   const clock = mock.clock(on, { now: 1_000_000 })
-  mock.env(on, { HOME, CLAUDE_CODE_HOST_SESSION_ID: HOST_ID })
+  mock.env(on, { ...env, CLAUDE_CODE_HOST_SESSION_ID: HOST_ID })
 
-  on('fs.read', (_, e) =>
-    e.path in files ? { value: files[e.path]! } : { deny: `ENOENT: ${e.path}` },
-  )
+  on('fs.read', (_, e) => {
+    const path = key(e.path)
+    return path in files ? { value: files[path]! } : { deny: `ENOENT: ${path}` }
+  })
   on('fs.write', (_, e) => {
-    files[e.path] = e.text
+    files[key(e.path)] = e.text
     return { value: undefined }
   })
   on('session.id', () => ({ value: 'cli-session' }))
@@ -33,9 +61,11 @@ const world = (on: On, files: Record<string, string>, router: Router) => {
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   on('process.run', async (_, e) => {
-    if (e.argv[0] === '/usr/bin/tee') {
-      logged.push(e.init?.stdin ?? '')
-      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    tried.push([...e.argv])
+    if (missing.includes(e.argv[0]!)) return { deny: `spawn ${e.argv[0]} ENOENT` }
+    const exit = exits[e.argv[0]!]
+    if (exit !== undefined) {
+      return { value: { exitCode: exit, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     asked.push({ argv: [...e.argv], stdin: e.init?.stdin ?? '', env: { ...(e.init?.env ?? {}) }, timeoutMs: e.init?.timeoutMs })
     const got = router(e.init?.stdin ?? '')
@@ -53,7 +83,14 @@ const world = (on: On, files: Record<string, string>, router: Router) => {
     }
     return done
   })
-  return { sent, asked, logged }
+  // the rows the plugin appended to its log, one per decided turn
+  const logged = {
+    get length() {
+      return (files[log] ?? '').split('\n').filter(Boolean).length
+    },
+    rows: () => (files[log] ?? '').split('\n').filter(Boolean),
+  }
+  return { sent, asked, tried, logged, files }
 }
 
 const hint = (target: string | null, handoff: string | null = null) =>
@@ -104,7 +141,7 @@ test('rewrites the main loop to the router target, same model for every step', a
   expect((call.timeoutMs ?? Infinity) <= 1500).toBe(true)
 
   expect(w.logged.length).toBe(1)
-  const row = JSON.parse(w.logged[0]!)
+  const row = JSON.parse(w.logged.rows()[0]!)
   expect(row).toEqual(expect.objectContaining({ turnId: 't1', from: OPUS, to: 'claude-haiku-5-5', reason: 'router says so' }))
   expect(typeof row.ts).toBe('number')
   expect(typeof row.ms).toBe('number')
@@ -138,14 +175,14 @@ test('fails open when the router process errors', async ($, on) => {
   const w = world(on, { [SPEED]: 'inline' }, () => 'fail')
   await turn($, 't1', 'x', 2)
   expect(w.sent.map(s => s.model)).toEqual([OPUS, OPUS])
-  expect(JSON.parse(w.logged[0]!).to).toBe(null)
+  expect(JSON.parse(w.logged.rows()[0]!).to).toBe(null)
 })
 
 test('fails open when the router takes longer than 1.5 s', async ($, on) => {
   const w = world(on, { [SPEED]: 'inline' }, () => 'slow')
   await turn($, 't1', 'x', 1)
   expect(w.sent.map(s => s.model)).toEqual([OPUS])
-  expect(JSON.parse(w.logged[0]!).reason).toMatch(/too slow/)
+  expect(JSON.parse(w.logged.rows()[0]!).reason).toMatch(/too slow/)
 })
 
 test('fails open on a bad exit or unparsable output', async ($, on) => {
@@ -231,4 +268,89 @@ test('marks the chat as inline before the router hook runs', async ($, on) => {
   world(on, files, () => ({ stdout: hint(null) }))
   await turn($, 't1', 'hello', 1)
   expect(files[MARKER]).toBe('1\n')
+})
+
+// ---- Windows: the engine reports the platform through OS=Windows_NT; paths, home and Python follow it ----
+
+test('windows: USERPROFILE home, backslash paths and py -3', async ($, on) => {
+  const files: Record<string, string> = { [WIN_SPEED]: 'inline\r\n' }
+  const w = world(on, files, () => ({ stdout: hint('claude-haiku-5-5') }), { env: WINDOWS, log: WIN_LOG })
+  await turn($, 't1', 'what is 2+2', 2)
+  expect(w.sent.map(s => s.model)).toEqual(['claude-haiku-5-5', 'claude-haiku-5-5'])
+  expect(w.asked.length).toBe(1)
+  expect(w.asked[0]!.argv).toEqual(['py', '-3', WIN_HINT])
+  expect((w.asked[0]!.timeoutMs ?? Infinity) <= 1500).toBe(true)
+  expect(files[WIN_MARKER]).toBe('1\n')
+  expect(w.logged.length).toBe(1)
+  expect(JSON.parse(w.logged.rows()[0]!)).toEqual(expect.objectContaining({ turnId: 't1', to: 'claude-haiku-5-5' }))
+})
+
+test('windows: the transcript path is built under USERPROFILE when the hook gave none', async ($, on) => {
+  const w = world(on, { [WIN_SPEED]: 'inline' }, () => ({ stdout: hint(null) }), { env: WINDOWS, log: WIN_LOG })
+  await $.turn.start({ text: 'hello', turnId: 't1' })
+  await runStep($, { turnId: 't1', index: 0 })
+  expect(JSON.parse(w.asked[0]!.stdin).transcript_path).toBe(`${WIN_HOME}\\.claude\\projects\\-work\\cli-session.jsonl`)
+})
+
+test('windows: the launcher install.ps1 recorded goes first', async ($, on) => {
+  const files = { [WIN_SPEED]: 'inline', [WIN_PYCMD]: 'py -3.12\r\n' }
+  const w = world(on, files, () => ({ stdout: hint('claude-haiku-5-5') }), { env: WINDOWS, log: WIN_LOG })
+  await turn($, 't1', 'x', 1)
+  expect(w.asked[0]!.argv).toEqual(['py', '-3.12', WIN_HINT])
+})
+
+test('windows: falls back to python when py is missing, and remembers it', async ($, on) => {
+  const w = world(on, { [WIN_SPEED]: 'inline' }, () => ({ stdout: hint('claude-haiku-5-5') }), {
+    env: WINDOWS, missing: ['py'], log: WIN_LOG,
+  })
+  await turn($, 't1', 'a', 1)
+  await turn($, 't2', 'b', 1)
+  expect(w.sent.map(s => s.model)).toEqual(['claude-haiku-5-5', 'claude-haiku-5-5'])
+  expect(w.tried.map(a => a[0])).toEqual(['py', 'python', 'python'])
+  expect(w.asked.map(a => a.argv)).toEqual([['python', WIN_HINT], ['python', WIN_HINT]])
+})
+
+test('windows: an interpreter that exits non-zero (Store stub) is skipped', async ($, on) => {
+  const w = world(on, { [WIN_SPEED]: 'inline' }, () => ({ stdout: hint('claude-haiku-5-5') }), {
+    env: WINDOWS, exits: { py: 9009 }, log: WIN_LOG,
+  })
+  await turn($, 't1', 'a', 1)
+  expect(w.tried.map(a => a[0])).toEqual(['py', 'python'])
+  expect(w.sent.map(s => s.model)).toEqual(['claude-haiku-5-5'])
+})
+
+test('windows: fails open when no Python can start', async ($, on) => {
+  const w = world(on, { [WIN_SPEED]: 'inline' }, () => ({ stdout: hint('claude-haiku-5-5') }), {
+    env: WINDOWS, missing: ['py', 'python'], log: WIN_LOG,
+  })
+  await turn($, 't1', 'a', 2)
+  expect(w.sent.map(s => s.model)).toEqual([OPUS, OPUS])
+  expect(JSON.parse(w.logged.rows()[0]!).to).toBe(null)
+})
+
+test('windows: a slow router is not retried with another interpreter', async ($, on) => {
+  const w = world(on, { [WIN_SPEED]: 'inline' }, () => 'fail', { env: WINDOWS, log: WIN_LOG })
+  await turn($, 't1', 'a', 1)
+  expect(w.sent.map(s => s.model)).toEqual([OPUS])
+  expect(w.tried.length).toBe(1)
+})
+
+test('windows: HOME wins over USERPROFILE when both are set', async ($, on) => {
+  const other = 'C:\\Users\\gitbash'
+  const files = { [WIN_SPEED]: 'predictive', [`${other}\\.autoswitch\\speed`]: 'inline' }
+  const w = world(on, files, () => ({ stdout: hint('claude-haiku-5-5') }), {
+    env: { ...WINDOWS, HOME: other }, log: `${other}\\.autoswitch\\inline.jsonl`,
+  })
+  await turn($, 't1', 'a', 1)
+  expect(w.asked.map(a => a.argv)).toEqual([['py', '-3', `${other}\\.autoswitch\\app\\hook\\hint.py`]])
+})
+
+test('the log keeps the last 2000 rows', async ($, on) => {
+  const old = Array.from({ length: 2500 }, (_, i) => JSON.stringify({ n: i })).join('\n') + '\n'
+  const w = world(on, { [SPEED]: 'inline', [LOG]: old }, () => ({ stdout: hint(null) }))
+  await turn($, 't1', 'a', 1)
+  const rows = w.logged.rows()
+  expect(rows.length).toBe(2000)
+  expect(JSON.parse(rows[0]!)).toEqual({ n: 501 })
+  expect(JSON.parse(rows.at(-1)!).turnId).toBe('t1')
 })

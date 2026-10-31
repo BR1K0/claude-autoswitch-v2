@@ -24,6 +24,16 @@ Two new speeds that answer the first message on the right model, with no stop no
 - The dry-run decision never writes state: no pin observation, no shadow log, no lasting-switch record, and the
   clipboard check no longer records what it saw.
 - Docs: README "Speed" section for all four speeds, the band, the newer-model upgrade; new demo image of the band.
+- **Windows: `inline`.** The plugin finds the home folder from `HOME`, then `USERPROFILE`, joins paths with the
+  platform's separator (Windows is told by `OS=Windows_NT`) and runs the router with the launcher `install.ps1`
+  recorded, then `py -3`, then `python` (the first that works is remembered; still one 1.5 s budget, fail-open). The
+  decision log is appended through the engine's file API instead of `/usr/bin/tee`, keeping the last 2000 rows.
+  `install.ps1` copies the plugin and its marketplace, `autoswitch speed inline` installs it as on macOS, and
+  `uninstall.ps1` removes it. Not yet tried live in the Windows desktop app.
+- **Windows: `predictive` is refused.** `autoswitch speed predictive` says it needs macOS and keeps the current speed;
+  a chat opened before the plugin falls back to `instant` on Windows (not `predictive`).
+- **CI:** `.github/workflows/tests.yml` runs the Python suite and the plugin's `claude plugin validate` / `test` on
+  Ubuntu, macOS and Windows, and parses `install.ps1` / `uninstall.ps1` on Windows.
 
 ## 0.2.0
 

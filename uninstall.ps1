@@ -33,6 +33,9 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# the autoswitch-inline plugin and its marketplace, if `autoswitch speed inline` installed them (as uninstall.sh does)
+& $Py $Cli _plugin-uninstall
+
 Write-Host '==> Stopping the scorer'
 try { Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue } catch {}
 try { Unregister-ScheduledTask -TaskName $Task -Confirm:$false -ErrorAction SilentlyContinue } catch {}
