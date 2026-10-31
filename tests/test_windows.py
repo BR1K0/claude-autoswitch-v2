@@ -604,6 +604,51 @@ class SpeedCliTest(unittest.TestCase):
                 self.assertEqual(self.run_cli("speed", "fast", win=win)[0], 2)
                 self.assertFalse(os.path.exists(os.path.join(self.base, "speed")))
 
+    def test_predictive_is_refused_on_windows_and_keeps_the_speed(self):
+        self.assertEqual(self.run_cli("speed", "instant", win=True)[0], 0)
+        code, out = self.run_cli("speed", "predictive", win=True)
+        self.assertEqual(code, 1)
+        self.assertIn("needs macOS", out)
+        self.assertIn("left at instant", out)
+        self.assertEqual(_rt(os.path.join(self.base, "speed"), encoding="utf-8"), "instant\n")
+        self.assertEqual(self.run_cli("speed", "predictive", win=False)[0], 0)  # macOS/Linux: accepted
+
+    def test_inline_on_windows_installs_the_plugin_like_macos(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd[1:])
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        os.environ["AUTOSWITCH_CLAUDE"] = r"C:\Users\me\AppData\Roaming\npm\claude.cmd"
+        self.addCleanup(os.environ.pop, "AUTOSWITCH_CLAUDE", None)
+        with mock.patch.object(subprocess, "run", side_effect=run):
+            code, out = self.run_cli("speed", "inline", win=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [["plugin", "marketplace", "add", self.cli.ROOT],
+                                 ["plugin", "install", "autoswitch-inline@claude-autoswitch", "--scope", "user"]])
+        self.assertIn("fall back to instant", out)
+        self.assertEqual(_rt(os.path.join(self.base, "speed"), encoding="utf-8"), "inline\n")
+        self.assertTrue(os.path.isdir(os.path.join(self.base, "inline")))
+
+    def test_inline_on_windows_prints_the_commands_without_claude(self):
+        with mock.patch.object(self.cli, "claude_bin", return_value=None):
+            code, out = self.run_cli("speed", "inline", win=True)
+        self.assertEqual(code, 0)
+        self.assertIn("claude plugin marketplace add", out)
+        self.assertIn("claude plugin install autoswitch-inline@claude-autoswitch --scope user", out)
+
+    def test_desktop_bundled_claude_is_found_on_windows(self):
+        roaming = tempfile.mkdtemp()
+        exe = os.path.join(roaming, "Claude", "claude-code", "2.1.309", "abc123", "claude.exe")
+        os.makedirs(os.path.dirname(exe))
+        _wt("", exe, "w")
+        env = {k: v for k, v in os.environ.items() if k != "AUTOSWITCH_CLAUDE"}
+        env["APPDATA"] = roaming
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(self.cli, "WIN", True), \
+             mock.patch("shutil.which", return_value=None), mock.patch.object(sys, "platform", "win32"):
+            self.assertEqual(self.cli.claude_bin(), exe)
+
     def test_cli_and_hook_agree(self):
         import importlib, sbqueue
         os.environ["AUTOSWITCH_DIR"] = self.base

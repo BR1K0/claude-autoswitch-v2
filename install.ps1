@@ -78,6 +78,8 @@ try {  # stop here if a copy fails (e.g. a file locked by antivirus) instead of 
     if (Test-Path $App) { Remove-Item -Recurse -Force $App -ErrorAction Stop }
     New-Item -ItemType Directory -Force $App -ErrorAction Stop | Out-Null
     foreach ($d in 'hook', 'acpmh', 'scorer', 'train', 'data', 'bin') { Copy-Item -Recurse -Force (Join-Path $Src $d) (Join-Path $App $d) -ErrorAction Stop }
+    # the autoswitch-inline plugin and its marketplace (speed inline), as install.sh copies them
+    foreach ($d in 'plugin', '.claude-plugin') { Copy-Item -Recurse -Force (Join-Path $Src $d) (Join-Path $App $d) -ErrorAction Stop }
     foreach ($f in 'WATCHER.md', 'VERSION', 'requirements.txt') { Copy-Item -Force (Join-Path $Src $f) $App -ErrorAction Stop }
     Get-ChildItem $App -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
 } catch { Die "could not copy the app to $App ($($_.Exception.Message))" }
@@ -232,8 +234,9 @@ Write-Host @'
 
   autoswitch report     what it would have done on your real prompts (after some use)
   autoswitch on         switch for real   (also: off | shadow | hint | status)
-  autoswitch speed      instant (default on fresh installs) or seamless, see the README
-                        (predictive and inline are macOS-first: the typing reader is macOS-only)
+  autoswitch speed      inline (recommended: right model on the first message, no stop, no wait),
+                        instant (default on fresh installs) or seamless, see the README
+                        (predictive is macOS-only: its typing reader uses macOS Accessibility)
 
 To switch on, you need one Watcher chat (details below).
 

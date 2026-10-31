@@ -12,7 +12,8 @@
   autoswitch speed [instant|seamless|predictive|inline]
                              how `on` switches. inline (recommended): the autoswitch-inline plugin picks each
                              turn's model, so the first message is answered by the right model with no stop and no
-                             wait (installs the plugin). predictive: switch while you type (macOS). instant: never
+                             wait (installs the plugin; macOS and Windows). predictive: switch while you type (macOS
+                             only; refused on Windows). instant: never
                              hold, the switch applies from the next message. seamless: hold, switch, re-send.
                              No argument: print the current value
 """
@@ -73,7 +74,8 @@ def get_speed():
 
 
 def claude_bin():
-    """The `claude` command: $AUTOSWITCH_CLAUDE, then PATH, then (macOS) the newest one bundled with the desktop app."""
+    """The `claude` command: $AUTOSWITCH_CLAUDE, then PATH (on Windows also claude.cmd from npm), then the newest one
+    bundled with the desktop app (macOS; on Windows best effort under the app's data folder)."""
     import glob
     import shutil
     if os.environ.get("AUTOSWITCH_CLAUDE"):
@@ -84,6 +86,17 @@ def claude_bin():
     if sys.platform == "darwin":
         app = glob.glob(os.path.join(HOME, "Library", "Application Support", "Claude", "claude-code", "*", "*",
                                      "claude.app", "Contents", "MacOS", "claude"))
+        if app:
+            return max(app, key=os.path.getmtime)
+    if WIN:
+        sys.path.insert(0, os.path.join(ROOT, "hook"))
+        try:
+            import paths
+            data = paths.claude_data_dirs("win32")
+        except Exception:
+            data = []
+        app = [f for d in data for f in glob.glob(os.path.join(d, "claude-code", "*", "*", "claude.exe"))
+               + glob.glob(os.path.join(d, "claude-code", "*", "claude.exe"))]
         if app:
             return max(app, key=os.path.getmtime)
     return None
@@ -100,7 +113,8 @@ def install_plugin():
     import subprocess
     os.makedirs(p("inline"), exist_ok=True)  # the plugin's per-chat markers
     if not os.path.isfile(os.path.join(ROOT, ".claude-plugin", "marketplace.json")):
-        print(f"note: no plugin marketplace in {ROOT}; run ./install.sh again from the repo, then this command")
+        again = "install.ps1" if WIN else "./install.sh"
+        print(f"note: no plugin marketplace in {ROOT}; run {again} again from the repo, then this command")
         return False
     claude = claude_bin()
     manual = "\n".join("  " + " ".join(f'"{a}"' if " " in a else a for a in c) for c in plugin_commands())
@@ -147,6 +161,12 @@ def speed(word=None):
     if word not in SPEEDS:
         print("usage: autoswitch speed [instant|seamless|predictive|inline]", file=sys.stderr)
         sys.exit(2)
+    if word == "predictive" and WIN:
+        # the typeahead reader (Swift, Accessibility) only exists on macOS: refuse, keep what is set
+        print("PREDICTIVE needs macOS (it reads the prompt box while you type); it is not available on Windows.\n"
+              f"  Speed left at {get_speed()}. Use `autoswitch speed inline` for the right model on the first message,\n"
+              "  or `autoswitch speed instant`.")
+        sys.exit(1)
     os.makedirs(BASE, exist_ok=True)
     with open(p("speed"), "w", encoding="utf-8") as f:
         f.write(word + "\n")
@@ -156,11 +176,10 @@ def speed(word=None):
         "predictive": "PREDICTIVE: the chat is switched while you type, so the message usually goes out on the right model with no stop.\n"
                       "  If the switch has not landed by Enter, an up-switch or a message of 400+ characters is held like seamless; anything else goes through.",
         "inline": "INLINE: the autoswitch-inline plugin picks each turn's model inside Claude Code: the right model on the first message, no stop, no wait.\n"
-                  "  Chats opened before the plugin was installed fall back to predictive until you open a new one.",
+                  "  Chats opened before the plugin was installed fall back to " + ("instant" if WIN else "predictive")
+                  + " until you open a new one.",
     }
     print(notes[word])
-    if word in ("predictive", "inline") and WIN:
-        print("note: the typing reader is macOS-only; on Windows predictive behaves like instant (plus the holds), and the inline plugin is untested")
     if word == "inline":
         install_plugin()
     if os.environ.get("AUTOSWITCH_SPEED") and os.environ["AUTOSWITCH_SPEED"].strip().lower() != word:

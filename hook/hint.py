@@ -206,7 +206,9 @@ def main():
     if sb.silent():
         return
     if sb.speed() == "inline" and not DRY and not sb.inline_marked(hook.get("session_id")):
-        os.environ["AUTOSWITCH_SPEED"] = "predictive"  # this chat has no plugin (opened before it was installed)
+        # this chat has no plugin (opened before it was installed): predictive on macOS; on Windows, which has no
+        # typeahead reader, instant
+        os.environ["AUTOSWITCH_SPEED"] = "instant" if sys.platform == "win32" else "predictive"
     inline = sb.speed() == "inline"
     mode = sb.mode()
     ho = mode != "off" and _handoff_on()  # Autoswitch v2: every new path below is behind `ho`

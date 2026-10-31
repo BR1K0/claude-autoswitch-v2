@@ -38,7 +38,7 @@ The installer sets everything up in `~/.autoswitch` (`%USERPROFILE%\.autoswitch`
 autoswitch report      # how many prompts would have switched, and to what
 ```
 
-Happy with it? Turn it on, with the recommended `inline` speed (macOS):
+Happy with it? Turn it on, with the recommended `inline` speed (macOS and Windows):
 
 ```bash
 autoswitch on
@@ -169,7 +169,7 @@ Speed only matters once switching is on (`autoswitch on`); in shadow, hint and o
 | Your prompt | never held | held only for an up-switch or a 400+ character message whose switch hasn't landed | never held | held, then re-sent by the Watcher |
 | You see | the band above the prompt box | nothing, or the stop notice when held | "↪ Switching to Haiku" on a normal answer | the stopped turn ("↪ Switched to Haiku"), then your prompt again |
 | Wait | none | none, unless held | none | a few seconds |
-| Needs | the autoswitch-inline plugin (macOS) | a Watcher, macOS, Accessibility access for Claude | a Watcher | a Watcher |
+| Needs | the autoswitch-inline plugin (macOS, Windows) | a Watcher, **macOS only**, Accessibility access for Claude | a Watcher | a Watcher |
 
 **Fresh installs get `instant`.** The installers write `speed=instant` only when there is no `mode` file yet (a first install) and no `speed` file. An upgrade, or a speed you picked, is never overwritten. With no `speed` file at all the hook uses `seamless`, so existing installs keep behaving as before. Fresh installs still start in shadow mode.
 
@@ -182,15 +182,15 @@ claude plugin marketplace add ~/.autoswitch/app
 claude plugin install autoswitch-inline@claude-autoswitch --scope user
 ```
 
-If the `claude` command can't be found (it is looked up on your PATH, then inside the desktop app; set `AUTOSWITCH_CLAUDE` to point at it), `autoswitch` prints these two commands for you to run. Then open a new chat: a chat loads plugins when it starts.
+On Windows the same two commands run against `%USERPROFILE%\.autoswitch\app`. If the `claude` command can't be found (it is looked up on your PATH, then inside the desktop app; set `AUTOSWITCH_CLAUDE` to point at it), `autoswitch` prints these two commands for you to run. Then open a new chat: a chat loads plugins when it starts.
 
-On each main-loop turn the plugin runs the installed hook in dry mode (`~/.autoswitch/app/hook/hint.py` with `AUTOSWITCH_DRY=1`: same scorer, budget mode, pins, dwell guard and handoff rules, no side effects) and sends the turn's requests to the model it picks. Subagents are left alone. If the router fails or takes more than 1.5 s, the turn runs on the chat's own model. The hook itself stops, queues and shows nothing in these chats, except notes you must see (a lost prompt, a handoff timeout). Each decision is logged in `~/.autoswitch/inline.jsonl`.
+On each main-loop turn the plugin runs the installed hook in dry mode (`~/.autoswitch/app/hook/hint.py` with `AUTOSWITCH_DRY=1`: same scorer, budget mode, pins, dwell guard and handoff rules, no side effects) and sends the turn's requests to the model it picks. It runs the hook with `python3` on macOS; on Windows with the launcher `install.ps1` recorded (`~/.autoswitch/python-cmd`, e.g. `py -3.12`), then `py -3`, then `python`, and remembers the first that works. Subagents are left alone. If the router fails or takes more than 1.5 s, the turn runs on the chat's own model. The hook itself stops, queues and shows nothing in these chats, except notes you must see (a lost prompt, a handoff timeout). Each decision is logged in `~/.autoswitch/inline.jsonl` (the last 2000 rows are kept).
 
-Tried live on one Mac (a desktop chat on Opus had its request answered by Haiku, with no stop); the packaging in this repo is covered by the plugin's own tests (`claude plugin test plugin/autoswitch-inline`) and the Python tests.
+Tried live on one Mac (a desktop chat on Opus had its request answered by Haiku, with no stop); the packaging in this repo is covered by the plugin's own tests (`claude plugin test plugin/autoswitch-inline`, with Windows cases) and the Python tests, which CI runs on macOS, Linux and Windows. **Not yet tried live on Windows** in the desktop app.
 
 **The band.** Above the prompt box the plugin shows what happened on the last turn ("↪ Haiku 5.5 answered", or "↪ Opus 5.5 (kept)" when the model was left alone) and the budget mode, with **Save / Balanced / Quality** buttons. A click writes `~/.autoswitch/budget`. The budget mode sets the confidence gates (save: switch down readily; quality: switch down rarely, up readily) when [v2](#v2-long-chats-handoffs-and-rollover-off-by-default) is on; with v2 off, the v1 gates apply whatever the band says.
 
-**Chats opened before the plugin** don't have it. The plugin marks every chat it runs in (`~/.autoswitch/inline/<chat id>`); a chat without the mark is handled as `predictive` until you open a new one. That fallback needs a Watcher.
+**Chats opened before the plugin** don't have it. The plugin marks every chat it runs in (`~/.autoswitch/inline/<chat id>`); a chat without the mark is handled as `predictive` (on Windows: `instant`) until you open a new one. That fallback needs a Watcher.
 
 ### predictive
 
@@ -281,7 +281,7 @@ The model mapping lives in `hook/policy.py` (`MODELS`). Edit `~/.autoswitch/app/
 - The classifier is small and trained on limited data. It will sometimes pick wrong. Escalation (up needs only 50%) is deliberately easier than downgrading (70%).
 - `/commands`, agent-to-agent messages and tool notifications are never held.
 - With `seamless` the switch adds a pause of a few seconds: two Watcher tool calls plus the app's own model change. `inline` adds none.
-- `inline` and `predictive` are macOS only for now (the plugin calls `python3`; the typing reader uses macOS Accessibility). On Windows, `predictive` behaves like `instant` plus the holds.
+- `predictive` is macOS only (the typing reader uses macOS Accessibility); on Windows `autoswitch speed predictive` refuses and keeps your current speed. `inline` works on macOS and Windows (Windows not yet tried live in the desktop app).
 - Several prompts sent in a quick burst can merge into one turn.
 - There's no escalation on failure yet. Going up is decided from the prompt, not from failing tests or "that's wrong".
 - Live switching has only been tried on a handful of prompts on one Mac, including 2 out of 2 switches up to Opus. Remote use through claude.ai/code is untested.
@@ -311,7 +311,16 @@ The model mapping lives in `hook/policy.py` (`MODELS`). Edit `~/.autoswitch/app/
 
 ## Windows
 
-Run the tests locally with `python3 -m unittest discover -s tests` (CI workflows are not set up in this repo yet). Please report what breaks.
+The tests run in CI on Windows, macOS and Linux (`.github/workflows/tests.yml`); locally run `python -m unittest discover -s tests`. Please report what breaks.
+
+To use the recommended `inline` speed on Windows, after `install.ps1`, in a new terminal:
+
+```powershell
+autoswitch on
+autoswitch speed inline   # runs `claude plugin marketplace add` and `claude plugin install` (or prints them)
+```
+
+Then open a new chat in the desktop app. If `claude` is not on your PATH, install it (`npm install -g @anthropic-ai/claude-code`) or set `AUTOSWITCH_CLAUDE` to its full path, and run `autoswitch speed inline` again. `uninstall.ps1` removes the plugin too.
 
 What is different from the Mac version:
 
@@ -320,6 +329,8 @@ What is different from the Mac version:
 - The hook command is written with the Python the installer found (full path, forward slashes), with no `2>/dev/null || true`. That path is pinned: if you upgrade Python and remove the old version (e.g. 3.12 to 3.13), the hook stops working until you run `install.ps1` again.
 - The `autoswitch` command is `%USERPROFILE%\.autoswitch\bin\autoswitch.cmd`, added to your user PATH. Open a new terminal after installing.
 - The Watcher prompt (`autoswitch watcher`) runs the Python the installer picked (`py -3.12`, `-3.11`, `-3.10`, `-3.13` or `-3.9` first, since scikit-learn 1.5.2 has wheels only for 3.9 to 3.13; `py -3` / `python` only as a last resort, with a warning) instead of `python3`, and `hook/watch.py` instead of `watch.sh`.
+- `predictive` is not available (`autoswitch speed predictive` says so and keeps your speed). Chats opened before the inline plugin was installed fall back to `instant`.
+- v2 handoff and rollover (off by default) use POSIX file locks and stay off on Windows.
 - Screenshots are detected through the Windows clipboard and never held, but their text is not read (no OCR yet); such prompts are scored on the typed text only.
 - **Unverified:** the Claude desktop app's session records (`claude-code-sessions`) are looked up in `%APPDATA%\Claude`, and in a Microsoft Store install under `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude`. This is inferred from how the app lays out its data folder on the Mac, not from documentation. If both folders exist, the first one that actually contains `claude-code-sessions` is used. If `autoswitch on` never switches, check that this folder exists, or point the hook at the right place with `AUTOSWITCH_SESSIONS`.
 - **Override:** set the user environment variable `AUTOSWITCH_SESSIONS` to the full path of the `claude-code-sessions` folder (e.g. `setx AUTOSWITCH_SESSIONS "%LOCALAPPDATA%\Packages\Claude_xxxx\LocalCache\Roaming\Claude\claude-code-sessions"`, then restart Claude) to skip the detection entirely. It is also unverified that the app runs hook commands from `settings.json` through a shell that accepts the quoted-path form we write.

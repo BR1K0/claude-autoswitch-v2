@@ -86,10 +86,15 @@ class PredictiveInlineTest(unittest.TestCase):
         p = os.path.join(self.d, "pending")
         return [_read_json(os.path.join(p, f)) for f in sorted(os.listdir(p)) if f.endswith(".json")] if os.path.isdir(p) else []
 
-    def _hook(self, prompt, url, **env):
+    def _hook(self, prompt, url, platform=None, **env):
+        """Runs hint.py; `platform` runs it as if on that OS (sys.platform set before the hook starts)."""
         tr = os.path.join(self.d, "t.jsonl")
         _write_text(tr, "x" * 400)
-        return subprocess.run([sys.executable, os.path.join(SB, "hint.py")], capture_output=True, text=True,
+        script = os.path.join(SB, "hint.py")
+        argv = [sys.executable, script] if platform is None else [
+            sys.executable, "-c", "import runpy, sys; sys.platform = %r; sys.argv = [%r]; runpy.run_path(%r, run_name='__main__')"
+            % (platform, script, script)]
+        return subprocess.run(argv, capture_output=True, text=True,
                               encoding="utf-8", env={**os.environ, "AUTOSWITCH_SCORER": url, **env},
                               input=json.dumps({"prompt": prompt, "session_id": "cli1", "transcript_path": tr}))
 
@@ -247,6 +252,7 @@ class PredictiveInlineTest(unittest.TestCase):
         self.assertEqual(out.stdout.strip(), "")           # no "no Watcher" note: inline does not use one
         self.assertEqual(self._dry("what is 2+2", url)["target"], "claude-haiku-5-5")
 
+    @unittest.skipIf(sys.platform == "win32", "predictive needs macOS; Windows falls back to instant (next test)")
     def test_inline_without_the_plugin_falls_back_to_predictive(self):
         _write_text(self.q.path("speed"), "inline\n")  # no inline/cli1 marker: a chat opened before the plugin
         url = scorer(self, "haiku", 0.99)
@@ -257,6 +263,20 @@ class PredictiveInlineTest(unittest.TestCase):
         out = self._hook("what is 2+2", url)
         self.assertTrue(passes_clean(out))
         self.assertIn("Switching", json.loads(out.stdout)["systemMessage"])          # predictive's submit path
+
+    def test_inline_without_the_plugin_falls_back_to_instant_on_windows(self):
+        # a 400+ character message: predictive holds it while the switch lands, instant never holds
+        long = "explain this " + "word " * 90
+        _write_text(self.q.path("speed"), "inline\n")  # no inline/cli1 marker: a chat opened before the plugin
+        url = scorer(self, "haiku", 0.99)
+        if sys.platform != "win32":
+            self.assertFalse(passes_clean(self._hook(long, url)))         # macOS: predictive holds it
+            shutil.rmtree(os.path.join(self.d, "pending"), True)
+        out = self._hook(long, url, platform="win32")
+        self.assertTrue(passes_clean(out))                                # Windows: instant, never held
+        _write_text(self.q.path("speed"), "instant\n")
+        shutil.rmtree(os.path.join(self.d, "pending"), True)
+        self.assertEqual(out.stdout, self._hook(long, url, platform="win32").stdout)  # exactly what instant does
 
     # --- stop text ---
     def test_stop_text_can_be_hidden(self):
@@ -308,7 +328,7 @@ class PredictiveInlineTest(unittest.TestCase):
                               text=True, encoding="utf-8", env={**os.environ, **env})
 
     def test_cli_speed_accepts_all_four(self):
-        for word in ("predictive", "instant", "seamless"):
+        for word in ("instant", "seamless") if sys.platform == "win32" else ("predictive", "instant", "seamless"):
             out = self._cli("speed", word)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertEqual(self._cli("speed").stdout.strip(), word)
@@ -316,9 +336,13 @@ class PredictiveInlineTest(unittest.TestCase):
 
     def test_cli_speed_inline_installs_the_plugin(self):
         log = os.path.join(self.d, "claude-args.txt")
-        fake = os.path.join(self.d, "fake-claude")
-        _write_text(fake, '#!/bin/sh\necho "$@" >> "%s"\n' % log)
-        os.chmod(fake, 0o755)
+        if sys.platform == "win32":  # a batch file: what npm installs `claude` as on Windows
+            fake = os.path.join(self.d, "fake-claude.cmd")
+            _write_text(fake, '@echo %%*>>"%s"\r\n' % log)
+        else:
+            fake = os.path.join(self.d, "fake-claude")
+            _write_text(fake, '#!/bin/sh\necho "$@" >> "%s"\n' % log)
+            os.chmod(fake, 0o755)
         out = self._cli("speed", "inline", AUTOSWITCH_CLAUDE=fake)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self._cli("speed").stdout.strip(), "inline")
