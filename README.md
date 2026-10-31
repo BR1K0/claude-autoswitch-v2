@@ -6,7 +6,15 @@ A tiny local classifier reads every prompt you send. If a different model would 
 
 ![The autoswitch-inline band above the prompt box: "↪ Opus 5.5 (kept) · Budget: Balanced [Save] [✓ Balanced] [Quality]"](docs/switch-demo.png)
 
-*The `inline` speed's band above the prompt box: which model answered the last turn (here Opus 5.5, kept), and the budget mode, one click to change.*
+*Pick a budget mode in the band above the prompt box; here is what each one saved and risked on 66 held-out test prompts ([how we measured](#what-each-mode-costs-you)):*
+
+| Budget mode | Saved vs always Opus (start on Opus / start on Haiku) | Hard questions sent to a weaker model | Overspend (stronger model than needed) |
+|---|---|---|---|
+| Save | 29% / 35% | 6% / 12% | 41% / 36% |
+| Balanced (default) | 26% / 33% | 6% / 6% | 45% / 36% |
+| Quality | 24% / 32% | 6% / 6% | 50% / 36% |
+| *for comparison: always Sonnet* | *38%* | *100%* | *55%* |
+| *always Haiku* | *97%* | *100%* | *0%* |
 
 > Measured on 150 real SWE-bench bugs: starting on Haiku and escalating only when needed cost **$0.055 per issue**, against about **$0.129** per Opus attempt ([numbers and caveats](#what-it-saves)).
 
@@ -106,6 +114,27 @@ Nothing is ever lost silently: if anything fails, the prompt goes through unchan
 - **Switching itself costs money.** Each model keeps its own prompt cache, so after a switch the history is re-read at full price. At published Anthropic prompt-caching rates, re-caching a 50k-token chat costs about $0.006 on Haiku, $0.125 on Sonnet and $0.25 on Opus. That is why long chats stay put. The policy's per-answer savings and the Haiku re-cache figure are rough estimates that haven't been calibrated.
 - The cost per issue is spend, not spend per *solved* issue. There is no measured always-Sonnet or always-Opus run on all 150.
 - 150 tasks from open-source Python repositories. Your work may look different. That is why shadow mode exists: measure on your own prompts first.
+
+## What each mode costs you
+
+The table at the top, in plain words: **no mode ever put a hard question on Haiku**; the risk is a hard question
+answered by Sonnet instead of Opus (1 or 2 of 17 here). **The saving is a quarter to a third of Opus's cost, not
+more**, because the scorer sends most easy coding work to Sonnet or Opus anyway, and Sonnet costs 62% of Opus per
+message. On the public scorer the three modes barely differ; which model the chat starts on matters more.
+
+**Careful with save mode on a less confident scorer.** On a second scorer (the maintainer's personal one) a chat
+starting on Haiku in save mode sent **all 17 hard questions to Sonnet**, and balanced 9 of 17; only quality kept them
+on Opus. If your hard questions matter, use balanced or quality.
+
+**How we measured.** 66 labelled prompts the scorer was not trained on: 36 design/architecture questions from
+`data/design_test.jsonl` (6 haiku, 13 sonnet, 17 opus) and 30 small coding tasks Haiku had already solved. Each went
+through the real decision path (`policy.decide` with the mode's gates, a short chat) from a chat on Opus 5.5 and
+one on Haiku 5.5. Cost: a typical message of 30k cached context, 1k new input and 800 output, at Opus 5.5 $4/$20,
+Sonnet 5.5 $2/$10 (cache reads $0.20) and Haiku 5.5 $0.10/$0.50 (cache read assumed $0.01). With 150k of context the
+savings shrink by about a third (19-24% for save). Limits: these are not your prompts; 17 hard questions is a small
+sample (one prompt = 6 points); labels are coarse; and **the scorer is the weak link**: it is right 94% of the time on
+the design prompts but only about a quarter of the time on the coding tasks. Full tables, both scorers and
+caveats: [docs/mode-tradeoffs.md](docs/mode-tradeoffs.md). Reproduce with `bench/modes.py`.
 
 ## v2: long chats, handoffs and rollover (off by default)
 
@@ -348,6 +377,7 @@ hook/                       UserPromptSubmit + PostModelSwitch hooks, policy, qu
                             (v2: handoff.py, rollover.py, budget.py, ctxblend.py, sizes.py, acpmh_bridge.py, stop.py)
 acpmh/                      ACPMH: the chat journal and handoff builder v2 uses (also usable on its own)
 docs/BENCHMARK.md           how the v2 defaults were measured
+docs/mode-tradeoffs.md      what each budget mode saves and risks (bench/modes.py reproduces it)
 scorer/scorer.py            the local scoring service
 train/train.py, data/       training script and the public data it uses
 WATCHER.md                  the prompt for the Watcher chat
