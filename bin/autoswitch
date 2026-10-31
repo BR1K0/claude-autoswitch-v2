@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""autoswitch: control the Claude Code desktop auto model switcher.
+
+  autoswitch status          mode, scorer, hook, Watcher, launch agent (macOS) / scheduled task (Windows)
+  autoswitch shadow          log what it WOULD do, change nothing (default after install)
+  autoswitch on              switch models for real (needs a running Watcher session)
+  autoswitch hint            only show a "Router suggests: ..." note
+  autoswitch off             do nothing at all
+  autoswitch report          summarise the shadow log: what would have been switched
+  autoswitch watcher         print the prompt to paste into a Haiku chat (the Watcher)
+  autoswitch unpin [app id]  clear the manual pin of one chat, or of all chats: a pinned chat is never switched
+  autoswitch speed [instant|seamless]
+                             how `on` switches: instant (never hold the prompt, the switch applies from the next
+                             message) or seamless (hold, switch, re-send). No argument: print the current value
+"""
+import json
+import os
+import sys
+import time
+import urllib.request
+
+WIN = sys.platform == "win32"
+HOME = os.path.expanduser("~")
+BASE = os.path.expanduser(os.environ.get("AUTOSWITCH_DIR", "~/.autoswitch"))
+APP = os.path.join(BASE, "app")
+SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+SPEEDS = ("instant", "seamless")
+MODES = {"on": "enforce", "shadow": "shadow", "hint": "hint", "off": "off"}
+MARK = os.path.join(APP, "hook") + os.sep  # our hook commands all point into this folder
+TASK = os.environ.get("AUTOSWITCH_TASK", "AutoswitchScorer")  # Windows scheduled task (install.ps1)
+EVENTS = {"UserPromptSubmit": "hint.py", "PostModelSwitch": "modelswitch.py"}
+
+
+def p(*a):
+    return os.path.join(BASE, *a)
+
+
+def read(name, default=""):
+    try:
+        with open(p(name), encoding="utf-8") as f:
+            return f.read().strip()
+    except (OSError, UnicodeError, ValueError):
+        return default
+
+
+def set_mode(word):
+    os.makedirs(BASE, exist_ok=True)
+    with open(p("mode"), "w", encoding="utf-8") as f:
+        f.write(MODES[word] + "\n")
+    for f in ("enabled",):  # a legacy flag file would override nothing, but keep the dir tidy
+        if os.path.exists(p(f)):
+            os.remove(p(f))
+    notes = {
+        "on": "ON: prompts worth a different model are switched automatically.\n  Keep a Watcher session open (run `autoswitch watcher`); without one nothing is blocked or switched.",
+        "shadow": "SHADOW: nothing is switched. Decisions are logged; see them with `autoswitch report`.",
+        "hint": "HINT: only a 'Router suggests: ...' note is shown.",
+        "off": "OFF: the hook does nothing.",
+    }
+    print(notes[word])
+
+
+def get_speed():
+    """Same rule as the hook (sbqueue.speed): $AUTOSWITCH_SPEED, then the `speed` file; anything else is seamless."""
+    v = (os.environ.get("AUTOSWITCH_SPEED") or "").strip() or read("speed")
+    return "instant" if v.strip().lower() == "instant" else "seamless"
+
+
+def speed(word=None):
+    if word is None:
+        print(get_speed())
+        return
+    word = word.strip().lower()
+    if word not in SPEEDS:
+        print("usage: autoswitch speed [instant|seamless]", file=sys.stderr)
+        sys.exit(2)
+    os.makedirs(BASE, exist_ok=True)
+    with open(p("speed"), "w", encoding="utf-8") as f:
+        f.write(word + "\n")
+    notes = {
+        "instant": "INSTANT: prompts are never held. This message answers on the current model; the switch applies from the next one.",
+        "seamless": "SEAMLESS: a prompt that needs another model is held, the chat is switched, and the prompt is re-sent on the new model.",
+    }
+    print(notes[word])
+    if os.environ.get("AUTOSWITCH_SPEED") and os.environ["AUTOSWITCH_SPEED"].strip().lower() != word:
+        print(f"note: AUTOSWITCH_SPEED={os.environ['AUTOSWITCH_SPEED']} is set and wins over the file")
+
+
+def scorer_up():
+    port = read("port", "8765")
+    try:
+        return urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1).read() == b"ok"
+    except Exception:
+        return False
+
+
+def hook_installed():
+    try:
+        with open(SETTINGS, encoding="utf-8-sig") as f:  # -sig: tolerate a BOM (PS 5.1 / old Notepad)
+            s = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return all(any(_ours(h.get("command", "")) for g in s.get("hooks", {}).get(ev, []) for h in g.get("hooks", []))
+               for ev in EVENTS)
+
+
+def watcher_age():
+    try:
+        return time.time() - os.path.getmtime(p("watcher.alive"))
+    except OSError:
+        return None
+
+
+def launchd_state():
+    import subprocess
+    label = os.environ.get("AUTOSWITCH_LABEL", "com.autoswitch.scorer")
+    r = subprocess.run(["launchctl", "list", label], capture_output=True, text=True)
+    return "loaded" if r.returncode == 0 else "not loaded"
+
+
+def startup_launcher():
+    """Windows fallback used by install.ps1 when Task Scheduler refuses: a launcher in the Startup folder."""
+    return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+                        "autoswitch-scorer.vbs")
+
+
+def task_state():
+    import subprocess
+    try:
+        r = subprocess.run(["schtasks", "/Query", "/TN", TASK], capture_output=True, text=True)
+    except OSError:
+        return "not registered"
+    if r.returncode == 0:
+        return "registered"
+    return "startup folder" if os.path.exists(startup_launcher()) else "not registered"
+
+
+def service_note():
+    return f"scheduled task {task_state()}" if WIN else f"launch agent {launchd_state()}"
+
+
+def status():
+    m = read("mode", "hint")
+    age = watcher_age()
+    print(f"mode     {m}" + ("  (switching for real)" if m == "enforce" else ""))
+    print(f"speed    {get_speed()}" + ("" if m == "enforce" else "  (used once switching is on)"))
+    print(f"scorer   {'running' if scorer_up() else 'NOT running'} on port {read('port', '8765')}  ({service_note()})")
+    print(f"hook     {'installed in ~/.claude/settings.json' if hook_installed() else 'NOT installed'}")
+    if age is not None and age < 30:
+        print("watcher  running")
+    else:
+        print("watcher  not running" + ("  <- needed for `autoswitch on`: run `autoswitch watcher`" if m == "enforce" else ""))
+
+
+def report():
+    rows = []
+    try:
+        with open(p("shadow.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    if not rows:
+        print("No decisions logged yet. Use Claude Code for a while in shadow mode, then run this again.")
+        return
+    n = len(rows)
+    sw = [r for r in rows if r.get("would_target") and r["would_target"] != r.get("current")]
+    by = {}
+    for r in sw:
+        t = r["would_target"]
+        by[t] = by.get(t, 0) + 1
+    print(f"{n} prompts seen, {len(sw)} ({len(sw) * 100 // n}%) would have been switched:")
+    for t, c in sorted(by.items(), key=lambda x: -x[1]):
+        print(f"  {c:4d}  -> {t}")
+    reasons = {}
+    for r in rows:
+        if not r.get("would_target"):
+            k = (r.get("reason") or "?").split(":")[0].split(",")[0][:40]
+            reasons[k] = reasons.get(k, 0) + 1
+    print("left alone because:")
+    for k, c in sorted(reasons.items(), key=lambda x: -x[1])[:6]:
+        print(f"  {c:4d}  {k}")
+    print("(prompt text is never logged, only lengths and decisions)")
+
+
+def unpin(app_id=None):
+    """Clear manual pins (pinned/<app id>.json, written when a person changes a chat's model by hand)."""
+    d = p("pinned")
+    names = [f[:-5] for f in os.listdir(d) if f.endswith(".json")] if os.path.isdir(d) else []
+    targets = [app_id] if app_id else names
+    n = 0
+    for name in targets:
+        try:
+            os.remove(os.path.join(d, name + ".json"))
+            n += 1
+        except OSError:
+            print(f"no pin for {name}")
+    print(f"cleared {n} pin(s)")
+
+
+def fwd(path):
+    """A path that works unchanged in cmd, PowerShell and Git Bash on Windows (forward slashes); quoted if it has spaces."""
+    path = path.replace("\\", "/") if WIN else path
+    return f'"{path}"' if " " in path else path
+
+
+def watcher_python(default=None):
+    """The command the Watcher uses to run our scripts: python3 on macOS; on Windows what install.ps1 found
+    (`py -3`, `python`, or a full path)."""
+    return read("python-cmd") or default or ("python" if WIN else "python3")
+
+
+def watcher_text(template, app=None, py=None):
+    return template.replace("{{APP}}", fwd(app or APP) if WIN else (app or APP)).replace("{{PY}}", py or watcher_python())
+
+
+def watcher_prompt():
+    with open(os.path.join(APP, "WATCHER.md"), encoding="utf-8") as f:
+        text = watcher_text(f.read())
+    print("Open a NEW chat in the Claude Code desktop app, pick the Haiku model, and paste this as its first message.\n"
+          "Leave that chat open while you work; it costs nothing while idle.\n"
+          "-----------------------------------------------------------------------")
+    print(text.rstrip())
+    print("-----------------------------------------------------------------------")
+
+
+# ---- used by install.sh / uninstall.sh (install.ps1 / uninstall.ps1 on Windows): edit ~/.claude/settings.json safely ----------------------------------------
+
+def _load_settings():
+    try:
+        # newline="": keep the file's own line endings. A leading BOM (PS 5.1 Set-Content/Out-File, old Notepad)
+        # is kept in raw so backups and the byte-exact restore stay exact, but stripped before parsing (utf-8-sig).
+        with open(SETTINGS, encoding="utf-8", newline="") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {}, None
+    try:
+        return json.loads(raw[1:] if raw.startswith(BOM) else raw), raw
+    except ValueError as e:
+        sys.exit(f"{SETTINGS} is not valid JSON ({e}); not touching it. Fix it and run again.")
+
+
+BOM = "\ufeff"
+
+
+def _style(raw):
+    """The indent, ASCII-ness and trailing newline of the user's file, so a rewrite changes as little as possible."""
+    if raw is None:
+        return {"indent": 2, "ensure_ascii": True, "nl": True, "bom": False}
+    bom = raw.startswith(BOM)
+    if bom:
+        raw = raw[1:]
+    indent = None
+    lines = raw.splitlines()
+    for line in lines[1:]:
+        if line.strip():
+            ws = line[:len(line) - len(line.lstrip())]
+            indent = ("\t" if ws.startswith("\t") else len(ws)) if ws else None
+            break
+    if len(lines) <= 1:
+        indent = None
+    return {"indent": indent, "ensure_ascii": raw.isascii(), "nl": raw.endswith("\n"), "bom": bom,
+            "crlf": "\r\n" in raw}
+
+
+def _dumps(data, style):
+    sep = (",", ": ") if style["indent"] is not None else (", ", ": ")
+    out = json.dumps(data, indent=style["indent"], ensure_ascii=style["ensure_ascii"], separators=sep)
+    out += "\n" if style["nl"] else ""
+    if style.get("crlf"):
+        out = out.replace("\n", "\r\n")  # JSON escapes newlines inside strings, so these are all line breaks
+    return (BOM if style.get("bom") else "") + out
+
+
+def _sha(text):
+    import hashlib
+    return None if text is None else hashlib.sha256(text.encode()).hexdigest()
+
+
+def _write_raw(text):
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    tmp = SETTINGS + ".autoswitch.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    if os.path.exists(SETTINGS):
+        os.chmod(tmp, os.stat(SETTINGS).st_mode & 0o777)
+    os.replace(tmp, SETTINGS)
+
+
+def _backup(raw):
+    if raw is None:
+        return None
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    dest, n = f"{SETTINGS}.autoswitch-backup-{stamp}", 1
+    while os.path.exists(dest):  # never overwrite an earlier backup made in the same second
+        n += 1
+        dest = f"{SETTINGS}.autoswitch-backup-{stamp}-{n}"
+    with open(dest, "w", encoding="utf-8", newline="") as f:
+        f.write(raw)
+    return dest
+
+
+def _ours(cmd):
+    return MARK in cmd or MARK.replace("\\", "/") in cmd.replace("\\", "/")
+
+
+def hook_command(python, script, platform=None):
+    """The command line written into settings.json for one of our hook scripts.
+
+    macOS/Linux (run by sh): `<python> "<script>" 2>/dev/null || true`, so a hook failure never shows up.
+    Windows: the interpreter is quoted, paths use forward slashes (valid in cmd, PowerShell and Git Bash, no
+    backslash escaping to get wrong) and there is no `2>/dev/null || true`, which cmd cannot parse; the
+    hook scripts catch every error themselves and always exit 0.
+    """
+    platform = sys.platform if platform is None else platform
+    path = os.path.join(APP, "hook", script)
+    if platform == "win32":
+        return f'"{python.replace(chr(92), "/")}" "{path.replace(chr(92), "/")}"'
+    return f'{python} "{path}" 2>/dev/null || true'
+
+
+def _strip(hooks, event, keep):
+    """Remove hook commands for which keep(cmd) is False from one event.
+    Returns (hook, group_index, position, group_meta, group_emptied) for each removed hook, indices as they were."""
+    removed, groups = [], []
+    for gi, g in enumerate(hooks.get(event, [])):
+        kept, gone = [], []
+        for pos, h in enumerate(g.get("hooks", [])):
+            if keep(h.get("command", "")):
+                kept.append(h)
+            else:
+                gone.append((h, pos))
+        meta = {k: v for k, v in g.items() if k != "hooks"}
+        for h, pos in gone:
+            removed.append((h, gi, pos, meta, not kept))
+        if kept:
+            groups.append({**g, "hooks": kept})
+    if groups:
+        hooks[event] = groups
+    else:
+        hooks.pop(event, None)
+    return removed
+
+
+def _load_state():
+    try:
+        with open(p("displaced.json"), encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        return None
+    except ValueError as e:
+        sys.exit(f"{p('displaced.json')} is unreadable ({e}); not touching settings.json.")
+    if isinstance(st, list):  # 0.1.0 format: a bare list of {"event", "hook"}
+        st = {"displaced": st}
+    return st
+
+
+def settings_install(python, watcher_cmd=None):
+    if watcher_cmd:  # how the Watcher should invoke Python (`py -3` etc.); see watcher_python()
+        os.makedirs(BASE, exist_ok=True)
+        with open(p("python-cmd"), "w", encoding="utf-8") as f:
+            f.write(watcher_cmd + "\n")
+    data, raw = _load_settings()
+    style = _style(raw)
+    hooks = data.setdefault("hooks", {})
+    before = json.dumps(data, sort_keys=True)
+    st = _load_state()
+    first = st is None
+    if first:
+        st = {"version": 2, "original": raw, "exact": True, "displaced": []}
+    known = [(d["event"], d["hook"]) for d in st["displaced"]]
+    new = []
+    for ev, script in EVENTS.items():
+        # the old router hint (hint.py from anywhere) and any earlier copy of ours are replaced, not stacked
+        for h, gi, pos, meta, emptied in _strip(hooks, ev, lambda c: script not in c):
+            if not _ours(h.get("command", "")) and (ev, h) not in known:
+                new.append({"event": ev, "hook": h, "group": gi, "pos": pos, "meta": meta, "emptied": emptied})
+        hooks.setdefault(ev, []).insert(0, {"hooks": [{
+            "type": "command",
+            "command": hook_command(python, script),
+            "timeout": 5,
+        }]})
+    if json.dumps(data, sort_keys=True) == before and os.path.exists(SETTINGS) and not first:
+        print("settings.json already up to date")
+        return
+    if not first and st.get("installed") != _sha(raw):
+        st["exact"] = False  # settings.json changed since the first install: restore by editing, not by bytes
+    st["displaced"] += new
+    text = _dumps(data, style)
+    st["installed"] = _sha(text)
+    bak = _backup(raw)
+    os.makedirs(BASE, exist_ok=True)
+    with open(p("displaced.json"), "w", encoding="utf-8") as f:
+        json.dump(st, f, indent=2)
+    _write_raw(text)
+    _note_written(text)
+    if bak:
+        print(f"backed up settings to {bak}")
+    for d in st["displaced"]:
+        print(f"replaced old hook: {d['hook'].get('command', '')[:80]}")
+    print("hook added to ~/.claude/settings.json")
+
+
+def _restore(hooks, displaced):
+    by_ev = {}
+    for d in displaced:
+        by_ev.setdefault(d["event"], []).append(d)
+    for ev, ds in by_ev.items():
+        groups = hooks.setdefault(ev, [])
+        if any("group" not in d for d in ds):  # 0.1.0 state: positions unknown, append as before
+            for d in ds:
+                groups.append({"hooks": [d["hook"]]})
+            continue
+        ds.sort(key=lambda d: (d["group"], d["pos"]))
+        done = set()
+        for d in ds:
+            gi = d["group"]
+            if d["emptied"]:
+                if gi in done:
+                    continue
+                mine = [x["hook"] for x in ds if x["group"] == gi]
+                groups.insert(min(gi, len(groups)), {**d["meta"], "hooks": mine})
+                done.add(gi)
+            elif gi < len(groups):
+                hs = groups[gi].setdefault("hooks", [])
+                hs.insert(min(d["pos"], len(hs)), d["hook"])
+            else:
+                groups.append({**d["meta"], "hooks": [d["hook"]]})
+
+
+SNAPSHOT_FILES = {"settings": lambda: SETTINGS, "displaced": lambda: p("displaced.json"), "python_cmd": lambda: p("python-cmd")}
+
+
+def _read_exact(path):
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+SNAPSHOT = lambda: p("install-snapshot.json")
+
+
+def _load_snapshot():
+    try:
+        with open(SNAPSHOT(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _save_snapshot(snap):
+    os.makedirs(BASE, exist_ok=True)
+    with open(SNAPSHOT(), "w", encoding="utf-8") as f:
+        json.dump(snap, f)
+
+
+def _note_written(text):
+    """settings_install: remember the exact bytes this run wrote, so a rollback can tell them from later user edits."""
+    snap = _load_snapshot()
+    if snap is not None:
+        snap["wrote"] = text
+        _save_snapshot(snap)
+
+
+COMMITTED = lambda: p("install-snapshot.done")
+
+
+def settings_commit():
+    """install.ps1, after every step succeeded: mark the snapshot as done, so it can never undo this good install.
+    A rename (atomic); if even that fails, a {"committed": true} flag in the snapshot, which _stale_snapshot honours."""
+    if not os.path.exists(SNAPSHOT()):
+        return
+    try:
+        os.replace(SNAPSHOT(), COMMITTED())
+        return
+    except OSError as e:
+        err = e
+    snap = _load_snapshot()
+    if snap is not None:
+        snap["committed"] = True
+        try:
+            _save_snapshot(snap)
+            return
+        except OSError as e:
+            err = e
+    sys.exit(f"could not mark the install as committed ({err}); delete {SNAPSHOT()} by hand")
+
+
+def _stale_snapshot():
+    """A snapshot left by an install that was killed before its finally ran: undo that run first.
+    A committed one (the install finished, only the clean-up failed) is just dropped."""
+    if not os.path.exists(SNAPSHOT()):
+        return
+    snap = _load_snapshot()
+    if snap is None or snap.get("committed"):  # unreadable (killed mid-write) or a finished install: nothing to undo
+        os.remove(SNAPSHOT())
+        return
+    print("found an interrupted install; undoing it first")
+    settings_rollback()
+
+
+def settings_snapshot():
+    """install.ps1, before it touches settings.json: remember the exact state, so a failed run can put it back."""
+    _stale_snapshot()
+    if os.path.exists(COMMITTED()):
+        os.remove(COMMITTED())
+    _save_snapshot({k: _read_exact(f()) for k, f in SNAPSHOT_FILES.items()})
+
+
+def settings_rollback():
+    """install.ps1, when a later step fails: undo this run. If settings.json is still what this run left there, put
+    settings.json, displaced.json and python-cmd back exactly as they were (a re-install keeps the earlier working hook,
+    a fresh install leaves no trace). If someone edited settings.json meanwhile, keep those edits and only swap our
+    hooks back to the ones in the snapshot: none after a fresh install, the earlier working hook after a re-install."""
+    snap = _load_snapshot()
+    if snap is None:
+        if os.path.exists(SNAPSHOT()):
+            os.remove(SNAPSHOT())
+        sys.exit("no install snapshot; run uninstall.ps1 to remove the hook")
+    cur = _read_exact(SETTINGS)
+    untouched = cur == snap.get("settings") or ("wrote" in snap and cur == snap["wrote"])
+    if untouched:
+        files = SNAPSHOT_FILES
+    else:
+        prev = snap.get("settings")
+        if prev is not None and hook_installed_in(prev):
+            _swap_hooks_keep_edits(prev)
+            files = {k: f for k, f in SNAPSHOT_FILES.items() if k in ("python_cmd", "displaced")}
+        else:
+            _remove_hook_keep_edits()
+            files = {k: f for k, f in SNAPSHOT_FILES.items() if k == "python_cmd"}
+    for k, f in files.items():
+        path, text = f(), snap.get(k)
+        if text is None:
+            if os.path.exists(path):
+                os.remove(path)
+        elif _read_exact(path) != text:
+            if k == "settings":
+                _write_raw(text)
+            else:
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(text)
+    os.remove(SNAPSHOT())
+    if not untouched:
+        if "displaced" in files:
+            print("settings.json was edited during the install: kept those edits and put the earlier hook back")
+        else:
+            print("settings.json was edited during the install: kept those edits and removed the hook;"
+                  " run install.ps1 again to add it back")
+        return
+    had = snap.get("settings") is not None and hook_installed_in(snap["settings"])
+    print("settings.json put back as it was before this run" + (" (the earlier hook is kept)" if had else " (hook removed)"))
+
+
+def _swap_hooks_keep_edits(prev_raw):
+    """A failed re-install with edits made meanwhile: keep the edits, replace this run's hook entries with the ones
+    the earlier, working install had (same events, same commands). Displaced hooks stay displaced: displaced.json
+    is put back from the snapshot by the caller."""
+    data, raw = _load_settings()
+    if raw is None:
+        return
+    try:
+        prev = json.loads(prev_raw[1:] if prev_raw.startswith(BOM) else prev_raw)
+    except ValueError:
+        return _remove_hook_keep_edits()
+    hooks = data.setdefault("hooks", {})
+    for ev in EVENTS:
+        _strip(hooks, ev, lambda c: not _ours(c))
+        # each group goes back at the index it had in the snapshot (in order, so earlier ones keep theirs),
+        # not at the top: no reorder the user did not make
+        old = [(i, g) for i, g in enumerate((prev.get("hooks") or {}).get(ev) or [])
+               if isinstance(g, dict) and any(isinstance(h, dict) and _ours(h.get("command", "")) for h in g.get("hooks") or [])]
+        for i, g in old:
+            mine = [h for h in g["hooks"] if isinstance(h, dict) and _ours(h.get("command", ""))]
+            groups = hooks.setdefault(ev, [])
+            groups.insert(min(i, len(groups)), {**{k: v for k, v in g.items() if k != "hooks"}, "hooks": mine})
+        if not hooks.get(ev):
+            hooks.pop(ev, None)
+    if not hooks:
+        data.pop("hooks", None)
+    _backup(raw)
+    _write_raw(_dumps(data, _style(raw)))
+
+
+def _remove_hook_keep_edits():
+    data, raw = _load_settings()
+    st = _load_state() or {"displaced": []}
+    if raw is not None:
+        hooks = data.get("hooks", {})
+        for ev in EVENTS:
+            _strip(hooks, ev, lambda c: not _ours(c))
+        _restore(hooks, st["displaced"])
+        if not hooks:
+            data.pop("hooks", None)
+        _backup(raw)
+        _write_raw(_dumps(data, _style(raw)))
+    if os.path.exists(p("displaced.json")):
+        os.remove(p("displaced.json"))
+
+
+def hook_installed_in(raw):
+    return any(_ours(h.get("command", "")) for h in _iter_hooks(raw))
+
+
+def _iter_hooks(raw):
+    try:
+        data = json.loads(raw[1:] if raw.startswith(BOM) else raw)
+    except ValueError:
+        return
+    for groups in (data.get("hooks") or {}).values():
+        for g in groups or []:
+            for h in g.get("hooks", []) or []:
+                if isinstance(h, dict):
+                    yield h
+
+
+def settings_uninstall():
+    _stale_snapshot()
+    data, raw = _load_settings()
+    st = _load_state() or {"displaced": []}
+    if raw is None:
+        return
+    if st.get("exact") and st.get("installed") == _sha(raw):
+        # nothing else touched settings.json since install: put the original bytes back
+        _backup(raw)
+        if st["original"] is None:
+            os.remove(SETTINGS)  # there was no settings.json before install and nothing was added since
+            print("hook removed: ~/.claude/settings.json did not exist before install and was removed")
+        else:
+            _write_raw(st["original"])
+            print("hook removed: ~/.claude/settings.json restored byte for byte")
+        return
+    hooks = data.get("hooks", {})
+    before = json.dumps(data, sort_keys=True)
+    for ev in EVENTS:
+        _strip(hooks, ev, lambda c: not _ours(c))
+    _restore(hooks, st["displaced"])
+    if not hooks:
+        data.pop("hooks", None)
+    if json.dumps(data, sort_keys=True) != before:
+        _backup(raw)
+        _write_raw(_dumps(data, _style(raw)))
+        print("hook removed from ~/.claude/settings.json (previous hooks restored)")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd in MODES:
+        set_mode(cmd)
+    elif cmd == "status":
+        status()
+    elif cmd == "report":
+        report()
+    elif cmd == "watcher":
+        watcher_prompt()
+    elif cmd == "speed":
+        speed(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "unpin":
+        unpin(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "_settings-install":
+        settings_install(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+    elif cmd == "_settings-uninstall":
+        settings_uninstall()
+    elif cmd == "_settings-snapshot":
+        settings_snapshot()
+    elif cmd == "_settings-rollback":
+        settings_rollback()
+    elif cmd == "_settings-commit":
+        settings_commit()
+    else:
+        print(__doc__)
+        sys.exit(0 if cmd in ("-h", "--help", "help") else 2)
+
+
+if __name__ == "__main__":
+    main()
