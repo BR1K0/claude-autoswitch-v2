@@ -1,0 +1,10 @@
+{
+  "name": "autoswitch-inline",
+  "version": "0.3.0",
+  "description": "claude-autoswitch, inline: picks each main-loop turn's model from the installed router (hook/hint.py, dry run) with no stop and no wait, and shows the router state and budget mode above the prompt. Inert unless ~/.autoswitch/speed is 'inline'.",
+  "author": {
+    "name": "claude-autoswitch"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

@@ -2,9 +2,11 @@
 
 **Claude Code desktop picks the cheapest model that can handle each prompt: Haiku for the quick stuff, Opus only when it matters.**
 
-A tiny local classifier reads every prompt you send. If a different model would do the job, your chat is switched to it and the prompt is sent again, automatically. Nothing leaves your machine.
+A tiny local classifier reads every prompt you send. If a different model would do the job, that prompt is answered by it, automatically. Nothing leaves your machine.
 
-![A chat switching itself to Haiku before answering](docs/switch-demo.png)
+![The autoswitch-inline band above the prompt box: "↪ Opus 5.5 (kept) · Budget: Balanced [Save] [✓ Balanced] [Quality]"](docs/switch-demo.png)
+
+*The `inline` speed's band above the prompt box: which model answered the last turn (here Opus 5.5, kept), and the budget mode, one click to change.*
 
 > Measured on 150 real SWE-bench bugs: starting on Haiku and escalating only when needed cost **$0.055 per issue**, against about **$0.129** per Opus attempt ([numbers and caveats](#what-it-saves)).
 
@@ -36,13 +38,16 @@ The installer sets everything up in `~/.autoswitch` (`%USERPROFILE%\.autoswitch`
 autoswitch report      # how many prompts would have switched, and to what
 ```
 
-Happy with it? Turn it on:
+Happy with it? Turn it on, with the recommended `inline` speed (macOS):
 
 ```bash
 autoswitch on
+autoswitch speed inline   # installs the autoswitch-inline Claude Code plugin; open a new chat afterwards
 ```
 
-Then open a new chat in the **Code tab** of the desktop app, set it to run **Local** on your own computer (not Cloud or Remote), choose **Haiku**, and paste the Watcher prompt (printed by the installer, or any time with `autoswitch watcher`). Leave that chat open. That's it.
+With `inline`, each prompt is answered by the right model from the first message: no stop notice, no re-send, no wait (see [Speed](#speed)). Chats with the plugin need no Watcher.
+
+For the other speeds (and for chats that were already open before you installed the plugin), open a new chat in the **Code tab** of the desktop app, set it to run **Local** on your own computer (not Cloud or Remote), choose **Haiku**, and paste the Watcher prompt (printed by the installer, or any time with `autoswitch watcher`). Leave that chat open. That's it.
 
 > The Watcher must run on your own machine. A regular claude.ai chat or a Cloud session runs on a remote Linux box with no access to `~/.autoswitch`, and will say "the watcher script isn't present".
 
@@ -55,7 +60,7 @@ Then open a new chat in the **Code tab** of the desktop app, set it to run **Loc
 | `autoswitch off` | do nothing at all |
 | `autoswitch report` | summary of the shadow log |
 | `autoswitch watcher` | print the Watcher prompt |
-| `autoswitch speed [instant\|seamless]` | how `on` switches (no argument: print it). See [Speed](#speed-instant-vs-seamless) |
+| `autoswitch speed [inline\|predictive\|instant\|seamless]` | how `on` switches (no argument: print it). `inline` also installs the plugin. See [Speed](#speed) |
 
 Running `autoswitch` with no argument is the same as `status`. `autoswitch help` lists the commands.
 
@@ -77,7 +82,7 @@ flowchart LR
 
 1. A `UserPromptSubmit` hook scores your prompt with a small local model (TF-IDF + logistic regression, about 6 ms).
 2. A policy decides whether switching is worth it. It needs high confidence to go *down* (70%) and only moderate confidence to go *up* (50%), because leaving a hard question on a weak model is the costlier mistake. A prompt that is unclear moves the chat to Sonnet (set `AUTOSWITCH_UNCLEAR=stay` to turn this off). It never touches a chat whose model you picked by hand; and it leaves long chats alone, because changing model throws away the prompt cache and re-reading a big history costs more than it saves.
-3. If it switches (with the default `seamless` speed), the hook holds your prompt and writes a request. The **Watcher**, a Haiku chat running a shell loop that costs nothing while idle, changes your chat's model and re-sends your prompt. You see "Switching to Haiku…" and then the answer. With `instant` speed the prompt is never held: it is answered on the current model and the Watcher only switches the chat for your next message (see [Speed](#speed-instant-vs-seamless)).
+3. How it switches depends on the [speed](#speed). With `inline` (recommended) a Claude Code plugin asks the same hook for its decision and sends that turn to the right model itself: nothing is held or re-sent. With `seamless` the hook holds your prompt and writes a request; the **Watcher**, a Haiku chat running a shell loop that costs nothing while idle, changes your chat's model and re-sends your prompt. With `instant` the prompt is never held: it is answered on the current model and the Watcher only switches the chat for your next message. `predictive` switches the chat while you type.
 4. A prompt with a pasted screenshot is never held (the re-send would lose the image). It is answered on the current model, and the chat switches for your *next* message. Text inside the screenshot is read locally with macOS Vision and scored too (on Windows the screenshot is detected but not read yet, so the prompt is scored on your typed text alone).
 
 Nothing is ever lost silently: if anything fails, the prompt goes through unchanged or you are told to send it again.
@@ -152,11 +157,48 @@ into a chat, and keep `~/.acpmh/` private.
 **Not verified live yet:** a real handoff and rollover in the app (the 300 tests use fakes), and whether a turn continued
 by the Stop hook may start a new chat.
 
-## Speed: instant vs seamless
+## Speed
 
-Speed only matters once switching is on (`autoswitch on`); in shadow, hint and off nothing is switched either way. Set it with `autoswitch speed instant` or `autoswitch speed seamless`; `autoswitch speed` and `autoswitch status` show the current value.
+Speed only matters once switching is on (`autoswitch on`); in shadow, hint and off nothing is switched either way. Set it with `autoswitch speed <word>`; `autoswitch speed` and `autoswitch status` show the current value.
+
+**Why there are four.** The model of a message is fixed the moment it is sent. A `UserPromptSubmit` hook that holds the message while the chat's model is switched still sends it on the old model (measured in a test chat). So `seamless` has to stop the message and re-send it, and `instant` only switches for the next message. Getting the right model on the *first* message with no stop and no wait needs either a switch before Enter (`predictive`) or a plugin inside Claude Code that picks the model of the request itself (`inline`).
+
+| | `inline` (recommended) | `predictive` | `instant` | `seamless` |
+|---|---|---|---|---|
+| Which model answers **this** prompt | the **right** one | usually the right one (see below) | the chat's **current** model | the **new** model |
+| Your prompt | never held | held only for an up-switch or a 400+ character message whose switch hasn't landed | never held | held, then re-sent by the Watcher |
+| You see | the band above the prompt box | nothing, or the stop notice when held | "↪ Switching to Haiku" on a normal answer | the stopped turn ("↪ Switched to Haiku"), then your prompt again |
+| Wait | none | none, unless held | none | a few seconds |
+| Needs | the autoswitch-inline plugin (macOS) | a Watcher, macOS, Accessibility access for Claude | a Watcher | a Watcher |
 
 **Fresh installs get `instant`.** The installers write `speed=instant` only when there is no `mode` file yet (a first install) and no `speed` file. An upgrade, or a speed you picked, is never overwritten. With no `speed` file at all the hook uses `seamless`, so existing installs keep behaving as before. Fresh installs still start in shadow mode.
+
+### inline
+
+`autoswitch speed inline` writes the speed and installs the bundled **autoswitch-inline** plugin for your user (both commands are safe to run again):
+
+```bash
+claude plugin marketplace add ~/.autoswitch/app
+claude plugin install autoswitch-inline@claude-autoswitch --scope user
+```
+
+If the `claude` command can't be found (it is looked up on your PATH, then inside the desktop app; set `AUTOSWITCH_CLAUDE` to point at it), `autoswitch` prints these two commands for you to run. Then open a new chat: a chat loads plugins when it starts.
+
+On each main-loop turn the plugin runs the installed hook in dry mode (`~/.autoswitch/app/hook/hint.py` with `AUTOSWITCH_DRY=1`: same scorer, budget mode, pins, dwell guard and handoff rules, no side effects) and sends the turn's requests to the model it picks. Subagents are left alone. If the router fails or takes more than 1.5 s, the turn runs on the chat's own model. The hook itself stops, queues and shows nothing in these chats, except notes you must see (a lost prompt, a handoff timeout). Each decision is logged in `~/.autoswitch/inline.jsonl`.
+
+Tried live on one Mac (a desktop chat on Opus had its request answered by Haiku, with no stop); the packaging in this repo is covered by the plugin's own tests (`claude plugin test plugin/autoswitch-inline`) and the Python tests.
+
+**The band.** Above the prompt box the plugin shows what happened on the last turn ("↪ Haiku 5.5 answered", or "↪ Opus 5.5 (kept)" when the model was left alone) and the budget mode, with **Save / Balanced / Quality** buttons. A click writes `~/.autoswitch/budget`. The budget mode sets the confidence gates (save: switch down readily; quality: switch down rarely, up readily) when [v2](#v2-long-chats-handoffs-and-rollover-off-by-default) is on; with v2 off, the v1 gates apply whatever the band says.
+
+**Chats opened before the plugin** don't have it. The plugin marks every chat it runs in (`~/.autoswitch/inline/<chat id>`); a chat without the mark is handled as `predictive` until you open a new one. That fallback needs a Watcher.
+
+### predictive
+
+The Watcher starts a small read-only reader (`hook/typeahead.swift`, built by `install.sh` into `~/.autoswitch/bin/typeahead`) that watches the Code tab's prompt box. When your draft has been still for 0.35 s it asks the hook for its decision on the draft (dry mode) and, if the chat should change model, queues a switch-only request. A changed draft withdraws its own request. A draft never starts a handoff, never counts toward the lasting-switch rule and is never sent anywhere. The reader never types, clicks or moves focus; it exits when the Watcher stops or the speed changes. It reads the app's window through macOS Accessibility, so Claude needs Accessibility access (System Settings > Privacy & Security > Accessibility); without it nothing is read and `predictive` behaves like `instant` (inferred, not yet checked on a fresh machine).
+
+At Enter, if the draft's switch has landed, the message goes out on the new model with nothing shown. If not (a new chat's first message, or a send within about 3 s of the draft settling), the message is held like `seamless` only when the wait pays off: an **up-switch** (otherwise a weaker model answers), or a message of **400+ characters** (`AUTOSWITCH_HOLD_CHARS`), the kind that starts long work. A short message that only wanted a cheaper model goes through at once, and the switch applies from the next one. Drafts are logged in `~/.autoswitch/typeahead.jsonl`; `AUTOSWITCH_TYPEAHEAD_DRY=1` logs what it would do and queues nothing.
+
+### instant and seamless
 
 | | `instant` | `seamless` |
 |---|---|---|
@@ -167,9 +209,22 @@ Speed only matters once switching is on (`autoswitch on`); in shadow, hint and o
 | You see | "↪ Switching to Haiku" as a note on a normal answer | the stopped turn, then your prompt again and its answer |
 | If the Watcher fails | nothing is lost: the answer already came, the chat just is not switched | a "please send it again" note on your next prompt |
 
-The honest trade-off: **with `instant`, the first message after a change of need can hit the wrong model.** A hard question asked in a Haiku chat is answered by Haiku, and only the follow-up gets Opus; a quick question in an Opus chat still costs Opus once. `seamless` gets that first message right, but every switch costs a stopped turn, a second copy of your prompt in the chat and a wait for the Watcher to re-send it (usually a few seconds, longer if the chat is busy). The routing decision itself (gates, dwell guard, pins, new-chat rules) is the same for both.
+The honest trade-off: **with `instant`, the first message after a change of need can hit the wrong model.** A hard question asked in a Haiku chat is answered by Haiku, and only the follow-up gets Opus; a quick question in an Opus chat still costs Opus once. `seamless` gets that first message right, but every switch costs a stopped turn, a second copy of your prompt in the chat and a wait for the Watcher to re-send it (usually a few seconds, longer if the chat is busy). The routing decision itself (gates, dwell guard, pins, new-chat rules) is the same for every speed.
 
-A prompt with a pasted screenshot is always handled the `instant` way, whatever the setting: re-sending it would drop the image.
+**Hide the stop text:** `echo hide > ~/.autoswitch/stoptext` leaves only the app's own "Operation stopped by hook:" prefix on a held message (the hook sends a single space: with no reason at all the app would not stop the message).
+
+A prompt with a pasted screenshot is always handled the `instant` way in `predictive`, `instant` and `seamless`: re-sending it would drop the image.
+
+## Newer model in the same tier
+
+When a chat stays in its tier but runs an older version of it (for example Opus 4.7, 4.8 or 5, Sonnet 5, Haiku 4.5), the router moves it to that tier's current model (Opus 5.5, Sonnet 5.5, Haiku 5.5): the newer models are stronger and cost less (Opus 5.5 is $4 / $20 per million input / output tokens against $5 / $25). It does not do this:
+
+- in a **long chat** (100k+ tokens, `AUTOSWITCH_UPGRADE_MAX_TOKENS`): the first message on a new model re-reads the whole chat at full price;
+- in a **pinned** chat (a model you picked by hand);
+- when the message is **handed off** to a new chat;
+- for the `[1m]` context variants of the current models, which count as current.
+
+In a brand-new chat the app has no record of the model yet; the inline plugin passes the request's model in `AUTOSWITCH_CURRENT_MODEL`, so a new chat started on an older model is upgraded too. The current models are listed in `hook/policy.py` (`MODELS`).
 
 ## Configuration
 
@@ -192,7 +247,11 @@ Set these as environment variables for Claude Code, for example in `~/.claude/se
 | `AUTOSWITCH_DIR` | `~/.autoswitch` | where state lives |
 | `AUTOSWITCH_PORT` | `8765` | scorer port (install time; saved in `~/.autoswitch/port`) |
 | `AUTOSWITCH_MODE` | *(file)* | `off`, `shadow`, `hint` or `enforce`; overrides the mode file that `autoswitch on/off/...` writes |
-| `AUTOSWITCH_SPEED` | *(file)* | `instant` or `seamless`; overrides the `speed` file that `autoswitch speed` writes. Anything else means `seamless` |
+| `AUTOSWITCH_SPEED` | *(file)* | `inline`, `predictive`, `instant` or `seamless`; overrides the `speed` file that `autoswitch speed` writes. Anything else means `seamless` |
+| `AUTOSWITCH_HOLD_CHARS` | `400` | `predictive`: a message this long is held when its switch has not landed yet |
+| `AUTOSWITCH_UPGRADE_MAX_TOKENS` | `100000` | no move to the tier's newer model in a chat longer than this |
+| `AUTOSWITCH_TYPEAHEAD_SETTLE` | `0.35` | `predictive`: seconds a draft must stay unchanged before it is scored |
+| `AUTOSWITCH_CLAUDE` | *(PATH)* | the `claude` command `autoswitch speed inline` uses to install the plugin |
 | `AUTOSWITCH_WATCHER_TTL` | `30` | seconds since the Watcher's last heartbeat before it counts as gone |
 
 Install-time only: `AUTOSWITCH_NO_LAUNCHD=1` skips the launch agent (the scorer is then not started; on Windows `AUTOSWITCH_NO_SERVICE=1` skips the scheduled task, `AUTOSWITCH_TASK` names it), and `AUTOSWITCH_LABEL` sets the launch agent label (default `com.autoswitch.scorer`). `AUTOSWITCH_THRESHOLD` is accepted as an older name for `AUTOSWITCH_DOWN_THRESHOLD`. Advanced knobs (rough, uncalibrated estimates used by the policy in `hook/policy.py`, `hook/hint.py` and `hook/images.py`; dollar figures are per switch or per answer):
@@ -215,13 +274,14 @@ The model mapping lives in `hook/policy.py` (`MODELS`). Edit `~/.autoswitch/app/
 ## Limits (please read)
 
 - **Claude Code desktop app only.** Switching uses the app's session tools. In the terminal CLI or headless runs the hook never blocks anything; it just logs.
-- **A Watcher chat must stay open.** Without one, `autoswitch on` degrades to shadow behaviour (prompts are never held) and tells you so.
+- **A Watcher chat must stay open** (except for chats with the `inline` plugin). Without one, `autoswitch on` degrades to shadow behaviour (prompts are never held) and tells you so.
 - **Paste screenshots, don't drag them.** Pasted images are detected through the clipboard. Dragged or uploaded images can't be seen, so a switch could drop them.
 - **A long chat stays on its model.** Switching discards the prompt cache; past about 60k tokens of history that costs more than it saves, so those chats are left alone. Going *up* to a stronger model is always allowed.
 - **A hand-picked model wins.** Choose a model from the menu or `/model` and Autoswitch leaves that chat alone.
 - The classifier is small and trained on limited data. It will sometimes pick wrong. Escalation (up needs only 50%) is deliberately easier than downgrading (70%).
 - `/commands`, agent-to-agent messages and tool notifications are never held.
-- The switch adds a pause of a few seconds: two Watcher tool calls plus the app's own model change.
+- With `seamless` the switch adds a pause of a few seconds: two Watcher tool calls plus the app's own model change. `inline` adds none.
+- `inline` and `predictive` are macOS only for now (the plugin calls `python3`; the typing reader uses macOS Accessibility). On Windows, `predictive` behaves like `instant` plus the holds.
 - Several prompts sent in a quick burst can merge into one turn.
 - There's no escalation on failure yet. Going up is decided from the prompt, not from failing tests or "that's wrong".
 - Live switching has only been tried on a handful of prompts on one Mac, including 2 out of 2 switches up to Opus. Remote use through claude.ai/code is untested.
@@ -281,7 +341,10 @@ If restoring `settings.json` fails (for example it is no longer valid JSON), uni
 install.sh / uninstall.sh   one-command setup and full revert (macOS)
 install.ps1 / uninstall.ps1 the same on Windows
 bin/autoswitch              the control command
+plugin/autoswitch-inline/   the Claude Code plugin behind the `inline` speed (tests: `claude plugin test plugin/autoswitch-inline`)
+.claude-plugin/             the plugin marketplace (`claude plugin marketplace add <this folder>`)
 hook/                       UserPromptSubmit + PostModelSwitch hooks, policy, queue, Watcher helpers
+                            (typeahead.py / typeahead.swift: the `predictive` speed's reader)
                             (v2: handoff.py, rollover.py, budget.py, ctxblend.py, sizes.py, acpmh_bridge.py, stop.py)
 acpmh/                      ACPMH: the chat journal and handoff builder v2 uses (also usable on its own)
 docs/BENCHMARK.md           how the v2 defaults were measured

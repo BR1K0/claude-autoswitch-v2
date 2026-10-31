@@ -233,6 +233,7 @@ Write-Host @'
   autoswitch report     what it would have done on your real prompts (after some use)
   autoswitch on         switch for real   (also: off | shadow | hint | status)
   autoswitch speed      instant (default on fresh installs) or seamless, see the README
+                        (predictive and inline are macOS-first: the typing reader is macOS-only)
 
 To switch on, you need one Watcher chat (details below).
 

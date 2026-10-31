@@ -61,6 +61,15 @@ def tier_of(model):
     return next((t for t in MODELS if t in m), None)
 
 
+def latest_in_tier(model):
+    """The tier's current model when `model` is an older version of it (claude-opus-4-7 -> claude-opus-5-5),
+    else None. Unknown names, other families and the current models themselves give None."""
+    tier = tier_of(model)
+    if not tier or model.split("[")[0] == MODELS[tier]:  # claude-opus-5-5[1m] is current, only a context option
+        return None
+    return MODELS[tier]
+
+
 def dwell_ok(cur, tgt, tokens, c=None):
     """True if a down-switch cur->tgt at `tokens` of history is worth the re-cache. Returns (ok, why)."""
     c = c or cfg()

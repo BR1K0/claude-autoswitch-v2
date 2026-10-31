@@ -27,6 +27,7 @@ say "Installing to $BASE"
 mkdir -p "$BASE" "$BASE/bin" "$BASE/logs"
 rm -rf "$APP"; mkdir -p "$APP"
 cp -R "$SRC/hook" "$SRC/acpmh" "$SRC/scorer" "$SRC/train" "$SRC/data" "$SRC/bin" "$APP/"
+cp -R "$SRC/plugin" "$SRC/.claude-plugin" "$APP/"  # the autoswitch-inline plugin and its marketplace (speed inline)
 cp "$SRC/WATCHER.md" "$SRC/VERSION" "$SRC/requirements.txt" "$APP/"
 find "$APP" -name __pycache__ -prune -exec rm -rf {} +
 chmod +x "$APP/bin/autoswitch" "$APP/hook/watch.sh"
@@ -48,10 +49,14 @@ if [ ! -f "$BASE/models/synthetic.pkl" ] || [ "$(cat "$BASE/models/.version" 2>/
   echo "$VERSION" > "$BASE/models/.version"
 fi
 
-# 4. screenshot reader (optional): lets the hook see text in a pasted screenshot
+# 4. screenshot reader (optional): lets the hook see text in a pasted screenshot.
+#    typeahead reader (optional, speed predictive): reads the prompt box while you type, never types or clicks
 if command -v swiftc >/dev/null 2>&1; then
   say "Building the screenshot reader"
   swiftc -O "$APP/hook/clipimg.swift" -o "$BASE/bin/clipimg" 2>/dev/null || warn "could not build the screenshot reader; screenshots are still never blocked"
+  say "Building the typeahead reader (speed predictive)"
+  pkill -f "$BASE/bin/typeahead" 2>/dev/null || true  # an old reader exits; the Watcher starts the new one
+  swiftc -O "$APP/hook/typeahead.swift" -o "$BASE/bin/typeahead" 2>/dev/null || warn "could not build the typeahead reader; predictive then behaves like instant"
 else
   warn "swiftc not found (xcode-select --install): screenshot text will not be read; screenshots are still never blocked"
 fi
@@ -132,7 +137,8 @@ $(printf '\033[1m')Installed claude-autoswitch $VERSION$(printf '\033[0m') in sh
 
   autoswitch report     what it would have done on your real prompts (after some use)
   autoswitch on         switch for real   (also: off | shadow | hint | status)
-  autoswitch speed      instant (default on fresh installs) or seamless, see the README
+  autoswitch speed      inline (recommended: right model on the first message, no stop, no wait),
+                        predictive, instant (default on fresh installs) or seamless, see the README
 
 To switch on, you need one Watcher chat (details below).
 
