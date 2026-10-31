@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0
+
+v2, everything off by default (`~/.autoswitch/handoff`, `~/.autoswitch/rollover`); with both off, decisions are
+exactly v0.1's (tested).
+
+- **Handoff to a new chat** for long chats, built by ACPMH (now bundled in `acpmh/`): v4 from 70k to 300k tokens, v5b
+  above (balanced). Below ~70k the chat still switches in place. Only for lasting switches.
+- **Budget modes** quality / balanced / save, optional spending limit with pacing, calibration hook.
+- **Context-aware scoring** for short messages.
+- **Real history size** from the transcript.
+- **Exactly-once delivery** of the handed-off message, settings carried over (never more), "please resend" and
+  "Autoswitch is paused" notes, one Watcher at a time.
+- **Automatic rollover** of chats over 200k into a part 2, with jobs, crash recovery and a loop guard; optional
+  `hook/stop.py` Stop hook.
+- Benchmark in `docs/BENCHMARK.md`.
+
 ## Unreleased
 
 - Instant mode is a first-class setting. `autoswitch speed [instant|seamless]` writes `~/.autoswitch/speed` (no argument prints the current value) and `autoswitch status` shows it. `install.sh` / `install.ps1` write `speed=instant` on a fresh install only (no `mode` file yet) and never overwrite an existing `speed` file; fresh installs still start in shadow mode, and upgrades keep `seamless` unless you change it. `WATCHER.md` and `hook/watch.py` spell out `send: false` (switch only, nothing sent or started) on macOS and Windows. README: new "Speed: instant vs seamless" section; trade-off: with `instant` the first message after a change of need is answered by the current model. Tests for instant with and without a target, pinned chats, new chats and screenshots, and for the CLI on both platforms.

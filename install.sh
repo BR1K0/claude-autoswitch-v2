@@ -26,7 +26,7 @@ PY="$(command -v python3 || true)"
 say "Installing to $BASE"
 mkdir -p "$BASE" "$BASE/bin" "$BASE/logs"
 rm -rf "$APP"; mkdir -p "$APP"
-cp -R "$SRC/hook" "$SRC/scorer" "$SRC/train" "$SRC/data" "$SRC/bin" "$APP/"
+cp -R "$SRC/hook" "$SRC/acpmh" "$SRC/scorer" "$SRC/train" "$SRC/data" "$SRC/bin" "$APP/"
 cp "$SRC/WATCHER.md" "$SRC/VERSION" "$SRC/requirements.txt" "$APP/"
 find "$APP" -name __pycache__ -prune -exec rm -rf {} +
 chmod +x "$APP/bin/autoswitch" "$APP/hook/watch.sh"

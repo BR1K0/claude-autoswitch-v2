@@ -171,27 +171,59 @@ def main():
     if sb.silent():
         return
     mode = sb.mode()
+    ho = mode != "off" and _handoff_on()  # Autoswitch v2: every new path below is behind `ho`
+    ro = ho and _rollover_on()  # Step 4 rollover: every rollover path is behind `ro` as well
+    paused = False
+    no_watcher = False
     if mode == "enforce" and os.environ.get("CLAUDE_CODE_ENTRYPOINT") != "claude-desktop":
         mode = "shadow"  # only desktop-app chats can be switched; never block the CLI or headless runs
-    no_watcher = False
     if mode == "enforce" and not sb.watcher_alive():
         mode, no_watcher = "shadow", True  # nobody would re-send a blocked prompt: only log, never block
+        paused = True
     raw = hook.get("prompt", "")
+    if ho:
+        import handoff
+        got = handoff.deliver(raw, host_session_id(), hook.get("session_id"))
+        if got is not None:  # part 2's first message: delivered exactly once, never routed
+            if got["out"]:
+                print(json.dumps(got["out"]))
+            return
+        try:
+            handoff.sweep_held()  # held requests no Watcher claimed: turned into "please resend" notes
+        except Exception:
+            pass
+    if ro:
+        import rollover
+        got = rollover.deliver(raw, host_session_id(), hook.get("session_id"))
+        if got is not None:  # part 2's first message of a rollover: delivered exactly once, never routed
+            if got["out"]:
+                print(json.dumps(got["out"]))
+            return
+        try:
+            rollover.recover()  # unfinished rollovers: resumed or undone
+        except Exception:
+            pass
     rid = sb.consume_pass(raw) if mode == "enforce" else None
     if rid:
         sb.take_lost(hook.get("session_id"), rid)  # it did arrive (maybe after settle timed out): drop "please resend"
         return  # re-sent by the Watcher: loop guard, route nothing
     if machine_traffic(raw):
+        if ro:  # a continued part 1 still gets events (monitors, linked sessions): never do part 2's work here
+            cont = rollover.continued(host_session_id()) if host_session_id() else None
+            if cont:
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                         "additionalContext": rollover.part1_context(cont, machine=True)}}))
         return  # agent-to-agent messages and tool/monitor notifications are not the user's prompts
     prompt = sb.bare(raw)  # score and queue the user's text, not the app's wrapper
     if not prompt:
         return  # only app-injected text: nothing to route, never block
     if not clean(prompt) or prompt.lstrip().startswith("/"):
         return
+    ctx_on = ho and handoff.context_enabled()
     asked_followup = is_followup(prompt)
     followup = asked_followup
     prev_user = last_context(hook.get("transcript_path"))[0] if followup else ""
-    scored = prev_user if prev_user else clean(prompt)
+    scored = prev_user if prev_user and not ctx_on else clean(prompt)
     followup = bool(prev_user)
     img = None
     if mode != "off":
@@ -199,9 +231,28 @@ def main():
         img = images.fresh_image()  # a pasted screenshot: never block (the re-send would drop it), score its text too
         if img and img["text"]:
             scored = f"{scored}\n\n[Text in the attached screenshot]\n{img['text']}"
-    result = score(scorer_url(), json.dumps({"text": scored, "input": model_input(scored)}).encode())
+    result = _score(scored, model_input)
     label = result["label"]
     confidence = result["probs"][label]
+    ext = {}
+    info = None
+    if ho:
+        from resolve import resolve
+        import ctxblend
+        info = resolve(hook.get("session_id"), wait=0)
+        previous = ctxblend.recent_user_messages(hook.get("transcript_path"))
+        ext["ctx_blend"] = False
+        if ctx_on:
+            ctx = ctxblend.build_context((info or {}).get("title"), previous)
+            if ctxblend.wants_context(clean(prompt), ctx):
+                p_alone = ctxblend.vec(result["probs"])
+                p_ctx = ctxblend.vec(_score(ctx + "\n" + scored, model_input)["probs"])
+                p = ctxblend.limited(p_alone, p_ctx, clean(prompt), ctx)
+                k = max(range(3), key=lambda j: p[j])
+                label, confidence = ctxblend.NAMES[k], p[k]
+                ext.update(ctx_blend=True, p_alone=[round(x, 3) for x in p_alone], p_blend=[round(x, 3) for x in p])
+            followup = False  # the blend replaces the follow-up rule
+        ext["new_task"] = ctxblend.new_task(clean(prompt), previous, (info or {}).get("title"))
     note = ", from your previous request" if followup else ""
     msg = f"Router suggests: {label.capitalize()} ({confidence:.0%} confident{note})"
 
@@ -210,13 +261,24 @@ def main():
         import pins
 
         app_id = host_session_id()
-        info = resolve(hook.get("session_id"), wait=0)  # fallback source, mainly for the current model
+        if not ho:
+            info = resolve(hook.get("session_id"), wait=0)  # fallback source, mainly for the current model
         cur = info and info["model"]
         tokens = history_tokens(hook.get("transcript_path"))
         if app_id and info:
             pins.observe(app_id, cur)  # remembers the model seen; a change nobody here made pins the chat
         new_chat = not info and first_prompt(hook.get("transcript_path"))
         pinned = bool(app_id) and pins.is_pinned(hook.get("session_id"), app_id, cur, hook.get("transcript_path"))
+        handoff_to = None
+        if ho:
+            import budget
+            import sizes
+            size = sizes.estimate(hook.get("transcript_path"))
+            bmode, pace_note = budget.effective_mode()
+            pts = budget.calibration()
+            conf_used = budget.calibrate(confidence, pts)
+            ext.update(budget_mode=bmode, pace=pace_note, calibrated=bool(pts), size_cheap=_int(size["cheap"]),
+                       size_precise=_int(size["precise"]), size_method=size["method"])
         if not app_id:
             d = {"target": None, "reason": "not a desktop app chat: never blocked"}
         elif pinned:
@@ -229,23 +291,63 @@ def main():
             # the app writes a chat's record only after its first answer, so neither the chat id nor
             # its starting model is known yet. Only act when the router is confident; the Watcher
             # looks the chat up and sets the model (a no-op if it already matches) before re-sending.
-            gate = policy.cfg()["down"]
-            if asked_followup and not followup:  # "ok do it" as a first prompt: nothing to inherit a score from
+            gate = policy.cfg()["down"] if not ho else budget.gates(bmode)["down"]
+            if asked_followup and not followup and not (ho and prev_user):  # "ok do it" as a first prompt: nothing to inherit a score from
                 d = {"target": None, "reason": "new chat, follow-up with no context"}
-            elif label in policy.MODELS and confidence >= gate:
+            elif label in policy.MODELS and (confidence if not ho else conf_used) >= gate:
                 d = {"target": policy.MODELS[label], "reason": f"new chat, {label} {confidence:.0%} confident"}
             else:
                 d = {"target": None, "reason": "new chat, below gate"}
-        else:
+        elif not ho:
             d = policy.decide(label, confidence, cur, tokens, pinned, enforce=(mode == "enforce"),
                               is_new=not info and transcript_is_new(hook.get("transcript_path")))
+        else:
+            d, handoff_to = _decide_v2(label, conf_used, cur, size, pinned, mode, info, hook, bmode, pts, app_id,
+                                       ext)
         if info and d["target"] == cur:
             d = {"target": None, "reason": "already on target model"}  # never block a chat that needs no switch
-        shadow_log({"ts": time.time(), "mode": mode, "session": app_id, "new_chat": new_chat, "current": cur,
-                    "label": label, "confidence": round(confidence, 3), "would_target": d["target"],
-                    "reason": d["reason"], "prompt_chars": len(prompt), "history_tokens_est": None if tokens is None else int(tokens),
-                    "history_bytes": None if tokens is None else int(tokens * TOKEN_BYTES), "pinned": pinned,
-                    "screenshot": bool(img), "ocr_chars": len(img["text"]) if img else 0})
+        log = {"ts": time.time(), "mode": mode, "session": app_id, "new_chat": new_chat, "current": cur,
+               "label": label, "confidence": round(confidence, 3), "would_target": d["target"],
+               "reason": d["reason"], "prompt_chars": len(prompt), "history_tokens_est": None if tokens is None else int(tokens),
+               "history_bytes": None if tokens is None else int(tokens * TOKEN_BYTES), "pinned": pinned,
+               "screenshot": bool(img), "ocr_chars": len(img["text"]) if img else 0}
+        ro_out = None
+        if ro:
+            try:
+                ro_mode = "enforce" if sb.mode() == "enforce" and app_id else mode  # the chat rolls itself over: no Watcher needed
+                ro_out, ro_log = rollover.on_prompt(hook, app_id, info, handoff_to, ro_mode, img, new_chat, prompt, bmode)
+                log.update(ro_log, rollover=ro_log.get("rollover", True))
+            except Exception:
+                ro_out = None
+        if ho:
+            log.update(ext, handoff=True, would_handoff=handoff_to)
+        shadow_log(log)
+        if ho:
+            notes = handoff.timeout_notes(app_id) if app_id else ""
+            if paused:
+                notes += handoff.paused_note(app_id or hook.get("session_id"))
+            try:
+                notes += handoff.watcher_size_note()
+            except Exception:
+                pass
+            if ro and app_id:
+                notes += rollover.take_note(app_id)
+            if ro_out:
+                ro_out["systemMessage"] = ro_out["systemMessage"] + notes + lost_note(sb.take_lost(hook.get("session_id")))
+                print(json.dumps(ro_out))
+                return
+            if (mode == "enforce" and handoff_to and app_id and info and not img and not new_chat
+                    and not handoff.open_for(app_id)):
+                from resolve import record
+                req = handoff.create(app_id, hook.get("session_id"), hook.get("transcript_path"), hook.get("cwd"),
+                                     handoff_to, prompt, info, record(hook.get("session_id")), hook.get("permission_mode"), size, bmode)
+                tgt = policy.tier_of(handoff_to).capitalize()
+                print(json.dumps({"systemMessage": f"↪ Continuing in a new chat on {tgt} (part {req['part']})" + notes
+                                  + lost_note(sb.take_lost(hook.get("session_id"))),
+                                  "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                         "additionalContext": handoff.instruction(req)}}))
+                return
+            msg += notes
         if mode == "enforce" and d["target"] and app_id and (info or new_chat) and img:
             # screenshot: let this turn through untouched and switch the chat for the NEXT one (no re-send)
             sb.enqueue(app_id, d["target"], prompt, label, confidence,
@@ -255,17 +357,76 @@ def main():
             # instant: never hold the prompt. This answer runs on the current model, the switch applies from the next message.
             sb.enqueue(app_id, d["target"], prompt, label, confidence,
                        cli_session_id=hook.get("session_id"), resend=False)
-            msg = f"\u21aa Switching to {policy.tier_of(d['target']).capitalize()}"
+            msg = f"↪ Switching to {policy.tier_of(d['target']).capitalize()}"
         elif mode == "enforce" and d["target"] and app_id and (info or new_chat):
             sb.enqueue(app_id, d["target"], prompt, label, confidence,
                        cli_session_id=hook.get("session_id"))
             # continue:false stops the turn with no "blocked" wording (the app shows "Operation stopped by hook:").
             # The text is what the user sees; the prompt is kept in the transcript, which is why the re-send is a second turn.
-            print(json.dumps({"continue": False, "stopReason": f"\u21aa Switched to {policy.tier_of(d['target']).capitalize()}"}))
+            print(json.dumps({"continue": False, "stopReason": f"↪ Switched to {policy.tier_of(d['target']).capitalize()}"}))
             return
-    if no_watcher:
+    if no_watcher and not ho:  # v2 shows its own "paused" note once per chat instead
         msg += " | Autoswitch is on but no Watcher session is running, so nothing was switched (see `autoswitch watcher`)"
     print(json.dumps({"systemMessage": msg + lost_note(sb.take_lost(hook.get("session_id")))}))
+
+
+def _handoff_on():
+    try:
+        import handoff
+        return handoff.enabled()
+    except Exception:
+        return False
+
+
+def _rollover_on():
+    try:
+        import rollover
+        return rollover.active()
+    except Exception:
+        return False
+
+
+def _int(x):
+    return None if x is None else int(x)
+
+
+def _score(text, model_input):
+    return score(scorer_url(), json.dumps({"text": text, "input": model_input(text)}).encode())
+
+
+def _decide_v2(label, confidence, cur, size, pinned, mode, info, hook, bmode, pts, app_id, ext):
+    """Autoswitch v2 decision for a known chat. Returns (decision, handoff target model or None).
+    1. the budget mode's gates pick the tier wanted (dwell guard off);
+    2. handoff.plan() applies break-even, the zone and the lasting-switch rule;
+    3. an in-place switch then runs today's cost check (dwell guard) with real tokens, no fixed cap."""
+    import handoff
+    import policy
+    import budget
+    import sizes
+    enforce = mode == "enforce"
+    is_new = not info and transcript_is_new(hook.get("transcript_path"))
+    want_tier = label if label in policy.MODELS else None
+    g = budget.gates(bmode, policy.tier_of(cur), want_tier, pts)
+    ov = {"down": g["down"], "up": g["up"], "max_down_tokens": float("inf")}
+    tokens = size["tokens"]
+    free = policy.decide(label, confidence, cur, tokens, pinned, enforce=enforce, is_new=is_new, overrides=ov,
+                         dwell=False)
+    tgt_tier = policy.tier_of(free["target"])
+    if tgt_tier and size["method"] != "precise" and tokens is not None \
+            and tokens >= handoff.breakeven(tgt_tier) * (1 - policy._f("AUTOSWITCH_ZONE", "0.10")):
+        size.update(sizes.estimate(hook.get("transcript_path"), force_precise=True))  # the zone: count precisely
+        tokens = size["tokens"]
+        ext.update(size_precise=_int(size["precise"]), size_method=size["method"])
+    prev = handoff.last_want(app_id)
+    handoff.record_want(app_id, tgt_tier)
+    pl = handoff.plan(tgt_tier, policy.tier_of(cur), size, prev, ext.get("new_task", False), bmode)
+    ext.update(plan=pl["action"], zone=pl["zone"], prev_want=prev)
+    if pl["action"] == "inplace":
+        d = policy.decide(label, confidence, cur, tokens, pinned, enforce=enforce, is_new=is_new, overrides=ov)
+        return d, None
+    if pl["action"] == "handoff":
+        return {"target": None, "reason": pl["reason"]}, free["target"]
+    return {"target": None, "reason": pl["reason"]}, None
 
 
 if __name__ == "__main__":

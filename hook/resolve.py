@@ -41,5 +41,19 @@ def _scan(cli_session_id):
     return None
 
 
+def record(cli_session_id):
+    """The whole app record for the CLI uuid (effort, permissionMode, connectors, added folders...), or None.
+    Autoswitch v2 only: what part 2 can inherit."""
+    for path in glob.glob(os.path.join(SESSIONS, "*", "*", "local_*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("cliSessionId") == cli_session_id:
+            return d
+    return None
+
+
 if __name__ == "__main__":
     print(json.dumps(resolve(sys.argv[1])))

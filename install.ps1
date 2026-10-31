@@ -77,7 +77,7 @@ try {  # stop here if a copy fails (e.g. a file locked by antivirus) instead of 
     foreach ($d in @($Base, (Join-Path $Base 'bin'), (Join-Path $Base 'logs'))) { New-Item -ItemType Directory -Force $d -ErrorAction Stop | Out-Null }
     if (Test-Path $App) { Remove-Item -Recurse -Force $App -ErrorAction Stop }
     New-Item -ItemType Directory -Force $App -ErrorAction Stop | Out-Null
-    foreach ($d in 'hook', 'scorer', 'train', 'data', 'bin') { Copy-Item -Recurse -Force (Join-Path $Src $d) (Join-Path $App $d) -ErrorAction Stop }
+    foreach ($d in 'hook', 'acpmh', 'scorer', 'train', 'data', 'bin') { Copy-Item -Recurse -Force (Join-Path $Src $d) (Join-Path $App $d) -ErrorAction Stop }
     foreach ($f in 'WATCHER.md', 'VERSION', 'requirements.txt') { Copy-Item -Force (Join-Path $Src $f) $App -ErrorAction Stop }
     Get-ChildItem $App -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
 } catch { Die "could not copy the app to $App ($($_.Exception.Message))" }

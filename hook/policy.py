@@ -76,16 +76,21 @@ def dwell_ok(cur, tgt, tokens, c=None):
     return True, f"saving ${saving:.3f} >= re-cache ${recache:.3f}"
 
 
-def decide(label, confidence, current_model, tokens=None, pinned=False, enforce=True, is_new=False):
+def decide(label, confidence, current_model, tokens=None, pinned=False, enforce=True, is_new=False,
+           overrides=None, dwell=True):
     """Return {"target": model id or None, "reason": str}. `enforce` only matters for the Sonnet default.
     `tokens` None means the history size is unknown. `is_new`: the chat has no answer yet (its transcript is
-    missing or has no assistant turn); an existing chat whose transcript can't be read is not new."""
+    missing or has no assistant turn); an existing chat whose transcript can't be read is not new.
+    Autoswitch v2 only (both default to today's behaviour): `overrides` replaces cfg() entries (the budget
+    mode's gates, the cap); dwell=False skips the dwell guard, to learn which tier the gates want."""
     cur = tier_of(current_model)
     if cur is None:
         return {"target": None, "reason": "unknown current model"}
     if pinned:
         return {"target": None, "reason": "pinned: model was picked by hand"}
     c = cfg()
+    if overrides:
+        c.update(overrides)
     want = label if label in MODELS else None
     lean_up = False
     if want and want != cur:
@@ -110,7 +115,7 @@ def decide(label, confidence, current_model, tokens=None, pinned=False, enforce=
         why = f"leaning {label} at {confidence:.0%}: one tier up to Sonnet"
     else:
         why = f"{label} at {confidence:.0%}"
-    if RANK[want] < RANK[cur]:
+    if dwell and RANK[want] < RANK[cur]:
         ok, dwell = dwell_ok(cur, want, tokens, c)
         if not ok:
             return {"target": None, "reason": f"dwell guard: {dwell}"}

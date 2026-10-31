@@ -17,16 +17,16 @@ macOS or Windows (see [Windows](#windows)), the Claude Code **desktop app**, and
 macOS:
 
 ```bash
-git clone https://github.com/BR1K0/claude-autoswitch.git
-cd claude-autoswitch
+git clone https://github.com/BR1K0/claude-autoswitch-v2.git
+cd claude-autoswitch-v2
 ./install.sh
 ```
 
 Windows (PowerShell, no administrator needed):
 
 ```powershell
-git clone https://github.com/BR1K0/claude-autoswitch.git
-cd claude-autoswitch
+git clone https://github.com/BR1K0/claude-autoswitch-v2.git
+cd claude-autoswitch-v2
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
@@ -101,6 +101,56 @@ Nothing is ever lost silently: if anything fails, the prompt goes through unchan
 - **Switching itself costs money.** Each model keeps its own prompt cache, so after a switch the history is re-read at full price. At published Anthropic prompt-caching rates, re-caching a 50k-token chat costs about $0.006 on Haiku, $0.125 on Sonnet and $0.25 on Opus. That is why long chats stay put. The policy's per-answer savings and the Haiku re-cache figure are rough estimates that haven't been calibrated.
 - The cost per issue is spend, not spend per *solved* issue. There is no measured always-Sonnet or always-Opus run on all 150.
 - 150 tasks from open-source Python repositories. Your work may look different. That is why shadow mode exists: measure on your own prompts first.
+
+## v2: long chats, handoffs and rollover (off by default)
+
+v1 leaves long chats alone, because switching model makes the new model re-read the whole history. v2 adds a cheaper
+way: a **handoff to a new chat** built by [ACPMH](acpmh/), the project memory bundled in this repo. ACPMH keeps a local
+journal of the chat (every message word for word, tool calls, test runs, commits, screenshots with their text read
+locally) and builds a compact handoff the new model reads instead of the full history. Part 2 can still look anything
+up in the journal.
+
+| Chat size | balanced (default) | save | quality |
+|---|---|---|---|
+| under ~70k tokens | switch in place (v1) | switch in place | switch in place |
+| 70k-300k | new chat with the v4 handoff | v4 handoff | switch in place |
+| over 300k | v5b handoff | v5 handoff | v4 handoff |
+
+In the benchmark ([docs/BENCHMARK.md](docs/BENCHMARK.md)) a handoff scored 94-99% of re-reading at a half to a fifth
+of the cost; compaction never won. A handoff only happens for a **lasting** switch (a new task, or two messages in a
+row wanting the other model); a one-off message in a long chat stays put.
+
+Also in v2:
+- **Real sizes:** the history is counted from the transcript (characters / 4 x 1.6), not file bytes.
+- **Budget modes:** `quality`, `balanced`, `save` (`AUTOSWITCH_BUDGET` or `~/.autoswitch/budget`), with an optional
+  limit (`AUTOSWITCH_LIMIT`, e.g. `$20/week`) that nudges the mode when you spend fast.
+- **Context-aware scoring:** short messages ("yes do it") are scored with the current task and your last 3 messages.
+  `AUTOSWITCH_CONTEXT=off` turns it off.
+- **Exactly once:** the handed-off message reaches part 2 once, with a one-time tag; "please resend" if it doesn't.
+  Part 2 gets the old chat's effort, folder and permission mode, never more.
+- **One Watcher:** a second Watcher stops itself.
+- **Automatic rollover:** a chat over `AUTOSWITCH_ROLLOVER_AT` (200k) moves to a fresh part 2 when you send a message
+  in it, at a quiet moment, with its task and scheduled jobs. Every step is saved, so a crash resumes or undoes it.
+  For rollover when the agent finishes a turn on its own (overnight work), also register `hook/stop.py` as a `Stop`
+  hook.
+
+Turn on (needs `enforce` mode):
+
+```bash
+echo on > ~/.autoswitch/handoff      # handoffs, budget modes, context scoring
+echo on > ~/.autoswitch/rollover     # rollover too (needs handoff on)
+```
+
+Turn off with `rm ~/.autoswitch/handoff ~/.autoswitch/rollover`: with both off, every decision is exactly v1's (tested).
+ACPMH fact extraction uses Haiku and runs only if `ANTHROPIC_API_KEY` is set and the `anthropic` package is installed;
+without it the handoff has the word-for-word journal only.
+
+**Privacy:** the journal under `~/.acpmh/` keeps your chats word for word, locally. Secrets are removed only from
+screenshot text, so anything typed into a chat (passwords included) is stored as typed. Never paste passwords or keys
+into a chat, and keep `~/.acpmh/` private.
+
+**Not verified live yet:** a real handoff and rollover in the app (the 300 tests use fakes), and whether a turn continued
+by the Stop hook may start a new chat.
 
 ## Speed: instant vs seamless
 
@@ -230,9 +280,11 @@ If restoring `settings.json` fails (for example it is no longer valid JSON), uni
 ```
 install.sh / uninstall.sh   one-command setup and full revert (macOS)
 install.ps1 / uninstall.ps1 the same on Windows
-.github/workflows/tests.yml GitHub Actions workflow (Linux + macOS + Windows)
 bin/autoswitch              the control command
 hook/                       UserPromptSubmit + PostModelSwitch hooks, policy, queue, Watcher helpers
+                            (v2: handoff.py, rollover.py, budget.py, ctxblend.py, sizes.py, acpmh_bridge.py, stop.py)
+acpmh/                      ACPMH: the chat journal and handoff builder v2 uses (also usable on its own)
+docs/BENCHMARK.md           how the v2 defaults were measured
 scorer/scorer.py            the local scoring service
 train/train.py, data/       training script and the public data it uses
 WATCHER.md                  the prompt for the Watcher chat

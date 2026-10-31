@@ -36,12 +36,46 @@ def p(*parts):
     return os.path.join(B, *parts)
 
 
+def _handoff_on():
+    v = os.environ.get("AUTOSWITCH_HANDOFF")
+    if v is None:
+        try:
+            with open(p("handoff"), encoding="utf-8") as f:
+                v = f.read()
+        except OSError:
+            v = ""
+    return v.strip().lower() in ("on", "1", "true", "yes")
+
+
+HO = _handoff_on()
+WID = os.environ.get("AUTOSWITCH_WATCHER_ID") or os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or ""
+TTL = float(os.environ.get("AUTOSWITCH_WATCHER_TTL") or 30)
+
+
 def heartbeat():
-    """The hook only blocks prompts while a Watcher is listening."""
+    """The hook only blocks prompts while a Watcher is listening.
+    v2 (AUTOSWITCH_HANDOFF on): the heartbeat carries this Watcher's session id, and a second Watcher that finds a
+    fresh heartbeat from another id prints DUPLICATE and stops (WATCHER.md: do not re-arm). Off: a plain touch."""
     try:
-        with open(p("watcher.alive"), "a"):
-            pass
-        os.utime(p("watcher.alive"), None)
+        if not HO or not WID:
+            with open(p("watcher.alive"), "a"):
+                pass
+            os.utime(p("watcher.alive"), None)
+            return
+        try:
+            with open(p("watcher.alive"), encoding="utf-8") as f:
+                other = f.read().strip()
+            age = time.time() - os.path.getmtime(p("watcher.alive"))
+        except OSError:
+            other, age = "", TTL
+        if other and other != WID and age < TTL:
+            with _out:
+                print("DUPLICATE " + other, flush=True)
+            os._exit(0)
+        tmp = p("watcher.alive.%d" % os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(WID)
+        os.replace(tmp, p("watcher.alive"))
     except OSError:
         pass
 
