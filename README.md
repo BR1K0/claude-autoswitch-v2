@@ -251,7 +251,7 @@ The model mapping lives in `hook/policy.py` (`MODELS`). Edit `~/.autoswitch/app/
 
 ## Windows
 
-CI (`.github/workflows/tests.yml`) runs the unit tests on Linux, macOS and Windows runners, a fresh-profile install on Windows, and a repeated race test. Please report what breaks.
+Run the tests locally with `python3 -m unittest discover -s tests` (CI workflows are not set up in this repo yet). Please report what breaks.
 
 What is different from the Mac version:
 
